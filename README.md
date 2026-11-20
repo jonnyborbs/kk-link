@@ -8,6 +8,11 @@ Mode, so a Bluetooth SPP adapter can never reconnect to it. Its main-unit USB
 port is a standard CDC-ACM serial port, so kk-link talks to the radio over USB
 and keeps BLE only on the app side.
 
+kk-link was inspired by Island Magic's B.B. Link project, which connects iOS
+packet apps to Kenwood radios over Bluetooth. kk-link seeks to continue its
+legacy with new hardware for newly released radios such as the TM-D750. It is
+an independent implementation and shares no code with B.B. Link.
+
 Status: **milestone 1**, a USB host spike. The firmware finds the radio on USB,
 sends the read-only CAT queries `ID` and `FQ 0` and logs the replies. It
 reconnects when the radio's USB cable is unplugged and plugged back in. The BLE
@@ -71,3 +76,8 @@ I (...) kk_link: band 0 frequency 145.470000 MHz
   https://github.com/LA3QMA/TH-D74-Kenwood
 - BLE-KISS API (planned app-side interface):
   https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md
+
+## License
+
+kk-link is licensed under the [Mozilla Public License 2.0](LICENSE)
+(SPDX: `MPL-2.0`).

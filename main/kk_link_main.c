@@ -1,4 +1,13 @@
 /*
+ * SPDX-License-Identifier: MPL-2.0
+ * Copyright (c) 2026 Jon Schulman
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+/*
  * kk-link milestone 1: USB host spike.
  *
  * Waits for a Kenwood TM-D750 on the ESP32-S3's native USB port, then runs a
