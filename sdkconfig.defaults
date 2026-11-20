@@ -1,0 +1,24 @@
+# kk-link defaults for ESP32-S3-DevKitC-1-N16R8
+CONFIG_IDF_TARGET="esp32s3"
+
+# 16 MB quad flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# 8 MB octal PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Console on UART0 (the DevKitC "UART" port). The native USB port is used as a
+# USB host for the radio, so no secondary USB-Serial-JTAG console.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# The TM-D750 is a composite CDC-ACM + USB Audio device; its configuration
+# descriptor is 248 bytes, just under the 256-byte default enumeration buffer.
+# Leave headroom in case a firmware update adds descriptors.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+
+# Allow per-tag DEBUG logs (e.g. raw radio RX hex dumps) at runtime
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

@@ -1,0 +1,15 @@
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+
+# Component manager downloads (re-fetched from dependencies.lock)
+managed_components/
+
+# Editors / OS
+.vscode/
+.idea/
+.cache/
+.clangd
+*.swp
+.DS_Store
