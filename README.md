@@ -8,15 +8,40 @@ Mode, so a Bluetooth SPP adapter can never reconnect to it. Its main-unit USB
 port is a standard CDC-ACM serial port, so kk-link talks to the radio over USB
 and keeps BLE only on the app side.
 
-kk-link was inspired by Island Magic's B.B. Link project, which connects iOS
+kk-link was inspired by Island Magic's [B.B. Link](https://getbblink.com) project, which connects iOS
 packet apps to Kenwood radios over Bluetooth. kk-link seeks to continue its
 legacy with new hardware for newly released radios such as the TM-D750. It is
 an independent implementation and shares no code with B.B. Link.
 
-Status: **milestone 1**, a USB host spike. The firmware finds the radio on USB,
-sends the read-only CAT queries `ID` and `FQ 0` and logs the replies. It
-reconnects when the radio's USB cable is unplugged and plugged back in. The BLE
-side is not implemented yet.
+Status: **milestone 2**, a working BLE-KISS bridge. Apps that speak the
+[BLE-KISS API](https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md)
+find the adapter as **"KK Link"**, and KISS frames flow both ways between the
+app and the radio's built-in TNC. Tested from a Mac BLE client (transmit, and
+receive of the digipeated echo); not yet tested with an iOS app.
+
+## How it works
+
+- **Idle:** the adapter advertises the BLE-KISS service and keeps the radio's
+  USB serial port in CAT mode. It reads the radio's TNC mode (`TN`) whenever
+  the radio connects.
+- **App subscribes** to the RX characteristic: the adapter saves the current
+  TNC mode in flash, switches the TNC to KISS on the same band
+  (`TN 2,<band>`), and passes bytes through unchanged in both directions.
+- **App unsubscribes or disconnects:** the adapter sends the KISS exit frame
+  `C0 FF C0`, waits for CAT to answer again and restores the saved TNC mode.
+- **Recovery:** KISS mode survives DTR drops and USB replugs. If the adapter
+  resets or the cable drops mid-session, the next connection finds the radio
+  silent on CAT, sends `C0 FF C0`, and restores the TNC mode saved in flash.
+
+| Characteristic | UUID | Direction |
+| --- | --- | --- |
+| Service | `00000001-ba2a-46c9-ae49-01b0961f68bb` | |
+| TX | `00000002-ba2a-46c9-ae49-01b0961f68bb` | app → radio, write / write without response |
+| RX | `00000003-ba2a-46c9-ae49-01b0961f68bb` | radio → app, notify |
+
+The adapter name "KK Link" is a placeholder. RadioMail enables frequency
+control (QSY) only for adapters named "B.B. Link"; that name is not used
+without coordinating with Island Magic.
 
 ## Hardware
 
@@ -25,8 +50,9 @@ side is not implemented yet.
   VBUS on the native USB port (needed for USB host mode).
 - DevKitC **"UART" USB-C port → computer**: power, flashing and console logs.
 - DevKitC **"USB" (native) USB-C port → radio's main-unit USB port**.
-- **Kenwood TM-D750**: set menu **984 (KISS) = USB (Main Unit)** to get KISS
-  over USB (needed from milestone 2 on; CAT works over USB regardless).
+- **Kenwood TM-D750**: set menu **984 (KISS) = USB (Main Unit)** so the TNC's
+  KISS port is the USB port (CAT works over USB with either setting). KISS runs
+  on the band the radio's TNC is set to.
 
 The radio enumerates as USB Full Speed VID `0x2166` / PID `0x9030` ("TM_D750"),
 a composite device with a CDC-ACM serial port (interfaces 0 and 1) and USB
@@ -59,22 +85,27 @@ under Homebrew's Python 3.12 by putting
 `/opt/homebrew/opt/python@3.12/libexec/bin` first on `PATH`.
 
 The `espressif/usb_host_cdc_acm` component is fetched by the IDF component
-manager on the first build.
+manager on the first build; NimBLE is part of ESP-IDF.
 
-Expected console output once the radio is plugged into the native USB port:
+Expected console output for one app session:
 
 ```
-I (...) kk_link: radio answering after 1 DTR pulse(s)
-I (...) kk_link: ID -> ID TM-D750
-I (...) kk_link: FQ 0 -> FQ 0,0145470000
-I (...) kk_link: band 0 frequency 145.470000 MHz
+I (...) ble_kiss: advertising as "KK Link"
+I (...) bridge: radio answering (ID TM-D750) after 1 DTR pulse(s)
+I (...) bridge: radio TNC mode: TN 0,1
+I (...) ble_kiss: app subscribed: KISS session open
+I (...) bridge: KISS on (band B); bridging app <-> radio
+I (...) ble_kiss: app gone: KISS session closed
+I (...) bridge: radio TNC mode restored: TN 0,1
+I (...) bridge: KISS off
 ```
 
 ## References
 
-- TH-D74/D75 CAT command set (works on the D750 for ID/FQ/MD/AS/TN/BT):
+- TH-D74/D75 CAT command set (works on the D750 for ID/FQ/MD/AS/TN/BT; `AI`
+  is not supported; `BC` replies with two values):
   https://github.com/LA3QMA/TH-D74-Kenwood
-- BLE-KISS API (planned app-side interface):
+- BLE-KISS API:
   https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md
 
 ## License
