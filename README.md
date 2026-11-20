@@ -70,6 +70,12 @@ D750's own TNC ignores them, so with `CONFIG_KK_LINK_QSY_EXPERIMENT` enabled
 - **On restore or at the end of the session:** it puts back the band's
   original VFO frequency and VFO/memory mode.
 - **If the adapter resets mid-session:** the TNC mode is restored, but the frequency is not.
+- **Deferred KISS switch:** because the QSY usually arrives about 2 s after the app connects
+  and needs CAT, the experiment build waits before switching the TNC to KISS. It
+  switches on the app's first data frame, or after 3 s if the app sends nothing
+  (listen-only apps miss packets during those 3 s). KISS parameter frames sent
+  before the switch are replayed to the TNC. After a restore (`EB`) it stays in
+  CAT mode until the app sends data again.
 
 Because RadioMail only sends these to an adapter named "B.B. Link", testing
 needs a local build with that name. Keep it in a gitignored

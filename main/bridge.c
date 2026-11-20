@@ -17,11 +17,14 @@
 #include "cat.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "nvs.h"
 #include "radio_usb.h"
 #include "sdkconfig.h"
@@ -34,7 +37,11 @@ static const char *TAG = "bridge";
 #define SETTLE_MS          500  /* after USB open, before the first DTR pulse */
 #define DTR_LOW_MS         250
 #define DTR_HIGH_MS        250
-#define KISS_EXIT_MS       300  /* after C0 FF C0, before talking CAT again */
+#define KISS_EXIT_MS       300  /* wake path: after C0 FF C0, before talking CAT */
+#define FAST_EXIT_MS       50   /* known-KISS exit: after C0 FF C0, before the ID probe */
+#define FAST_EXIT_TRIES    3    /* ID probes after a known-KISS exit before pulsing DTR */
+#define FAST_EXIT_ID_MS    300
+#define KISS_GRACE_MS      3000 /* QSY build: stay in CAT this long after subscribe */
 #define RETRY_PERIOD_MS    5000 /* re-try a radio that did not answer */
 #define APP_TX_BUF_SIZE    4096 /* app -> radio; several queued frames */
 #define APP_TX_WAIT_MS     5000 /* how long app data may wait for KISS to come up */
@@ -74,6 +81,7 @@ typedef enum {
     EV_SESSION_CLOSE,
     EV_QSY,         /* arg: frequency in Hz */
     EV_QSY_RESTORE,
+    EV_KISS_NEEDED, /* arg: 0 = grace period over, 1 = app sent data */
 } bridge_event_t;
 
 typedef struct {
@@ -98,6 +106,23 @@ static uint32_t s_dropped_to_app;
 static bool s_qsy_saved;     /* s_orig_vm / s_orig_fq hold the pre-QSY state */
 static char s_orig_vm[16];   /* e.g. "VM 1,1" */
 static char s_orig_fq[24];   /* e.g. "FQ 1,0144390000" (VFO frequency) */
+static bool s_kiss_needed;   /* the session needs the TNC in KISS now (see lazy entry) */
+static TimerHandle_t s_grace_timer;
+
+/*
+ * KISS parameter frames (TXDELAY, P, SlotTime, TXtail, FullDuplex) that arrive
+ * while the radio is still in CAT mode are kept here and replayed when KISS
+ * comes up, newest value per parameter. Guarded by s_param_lock together with
+ * the switch to KISS, so a frame is either replayed or forwarded, never lost.
+ */
+#define KISS_PARAM_SLOTS   6
+#define KISS_PARAM_MAXLEN  8
+typedef struct {
+    uint8_t len;
+    uint8_t data[KISS_PARAM_MAXLEN];
+} kiss_param_t;
+static kiss_param_t s_params[KISS_PARAM_SLOTS];
+static SemaphoreHandle_t s_param_lock;
 
 /* ---------- callbacks (other tasks' context) ---------- */
 
@@ -265,6 +290,33 @@ static bool wake_radio(void)
     return false;
 }
 
+/*
+ * Leave KISS when we know the TNC is in it, and wait for CAT. After the exit
+ * frame the radio answers CAT straight away (DTR is still high), so probe with
+ * ID first and only fall back to the slow DTR wake if that fails.
+ */
+static bool exit_kiss_to_cat(void)
+{
+    const int64_t t0 = esp_timer_get_time();
+    set_kiss_active(false);
+    s_in_kiss = false;
+    radio_usb_write(KISS_EXIT, sizeof(KISS_EXIT), 500);
+    vTaskDelay(pdMS_TO_TICKS(FAST_EXIT_MS));
+    char reply[CAT_LINE_MAX];
+    for (int attempt = 1; attempt <= FAST_EXIT_TRIES; attempt++) {
+        cat_reset();
+        if (cat_command("ID", reply, sizeof(reply), FAST_EXIT_ID_MS) == ESP_OK &&
+            strncmp(reply, "ID ", 3) == 0) {
+            ESP_LOGI(TAG, "KISS exit -> CAT in %lld ms (probe %d)",
+                     (long long)((esp_timer_get_time() - t0) / 1000), attempt);
+            return true;
+        }
+    }
+    ESP_LOGW(TAG, "no CAT reply after KISS exit; falling back to DTR wake");
+    send_kiss_exit();
+    return wake_radio();
+}
+
 /* ---------- state transitions (control task only) ---------- */
 
 static void radio_bringup(void)
@@ -344,8 +396,20 @@ static bool enter_kiss(void)
     }
     s_in_kiss = true;
     s_dropped_to_app = 0;
+
+    int replayed = 0;
+    xSemaphoreTake(s_param_lock, portMAX_DELAY);
+    for (int i = 0; i < KISS_PARAM_SLOTS; i++) {
+        if (s_params[i].len) {
+            radio_usb_write(s_params[i].data, s_params[i].len, 500);
+            replayed++;
+        }
+    }
     set_kiss_active(true);
-    ESP_LOGI(TAG, "KISS on (band %c); bridging app <-> radio", band == '0' ? 'A' : 'B');
+    xSemaphoreGive(s_param_lock);
+
+    ESP_LOGI(TAG, "KISS on (band %c); bridging app <-> radio%s", band == '0' ? 'A' : 'B',
+             replayed ? " (replayed app KISS parameters)" : "");
     return true;
 }
 
@@ -429,40 +493,49 @@ static bool qsy_set_cat(uint32_t hz)
     return true;
 }
 
-/* Leave KISS, run a CAT step, and go back into KISS. Control task only. */
+static void restart_grace_timer(void)
+{
+#if CONFIG_KK_LINK_QSY_EXPERIMENT
+    xTimerReset(s_grace_timer, 0);
+#endif
+}
+
+/*
+ * Run a QSY step over CAT. With lazy KISS entry the radio is usually still in
+ * CAT mode, so no mode change is needed at all. If KISS is already on, leave
+ * it for the CAT step; after a QSY go straight back, after a restore stay in
+ * CAT (the app is about to leave) until it sends data again. Control task only.
+ */
 static void qsy_handle(bridge_event_t type, uint32_t hz)
 {
-    if (!s_usb_up || !s_radio_ok || !s_in_kiss) {
-        ESP_LOGW(TAG, "QSY ignored: no active KISS session");
+    if (!s_usb_up || !s_radio_ok || !s_want_kiss) {
+        ESP_LOGW(TAG, "QSY ignored: no app session");
         return;
     }
-    set_kiss_active(false);
-    send_kiss_exit();
-    s_in_kiss = false;
-    if (!wake_radio()) {
+    const bool was_kiss = s_in_kiss;
+    if (was_kiss && !exit_kiss_to_cat()) {
         ESP_LOGE(TAG, "QSY: radio silent after KISS exit");
         s_radio_ok = false;
         return;
     }
     if (type == EV_QSY) {
         qsy_set_cat(hz);
+        if (was_kiss) {
+            enter_kiss();
+        }
     } else {
         qsy_restore_cat();
-    }
-    if (s_want_kiss) {
-        enter_kiss();
+        s_kiss_needed = false;
+        restart_grace_timer();
     }
 }
 
 static void leave_kiss(void)
 {
-    set_kiss_active(false);
-    send_kiss_exit();
-    s_in_kiss = false;
     if (s_dropped_to_app) {
         ESP_LOGW(TAG, "%lu radio bytes dropped (app too slow)", (unsigned long)s_dropped_to_app);
     }
-    if (!wake_radio()) {
+    if (!exit_kiss_to_cat()) {
         ESP_LOGE(TAG, "radio silent after KISS exit");
         s_radio_ok = false;
         return;
@@ -477,14 +550,16 @@ static void reconcile(void)
     if (!s_usb_up || !s_radio_ok) {
         return;
     }
-    if (s_want_kiss && !s_in_kiss) {
+    if (s_want_kiss && s_kiss_needed && !s_in_kiss) {
         enter_kiss();
     } else if (!s_want_kiss && s_in_kiss) {
         leave_kiss();
     } else if (!s_want_kiss && !s_in_kiss) {
+        /* Session over without KISS on (lazy entry), or an interrupted one. */
+        qsy_restore_cat();
         char saved[sizeof(s_orig_tn)];
         if (nvs_load_orig(saved, sizeof(saved))) {
-            restore_tnc(); /* leftover from an interrupted session */
+            restore_tnc();
         }
     }
 }
@@ -510,9 +585,31 @@ static void control_task(void *arg)
                 break;
             case EV_SESSION_OPEN:
                 s_want_kiss = true;
+#if CONFIG_KK_LINK_QSY_EXPERIMENT
+                /* Lazy entry: a QSY usually follows within ~2 s and needs CAT,
+                 * so don't switch to KISS until the app sends data or the
+                 * grace period ends. */
+                s_kiss_needed = false;
+                xTimerReset(s_grace_timer, 0);
+                ESP_LOGI(TAG, "app session: staying in CAT until data or %d ms", KISS_GRACE_MS);
+#else
+                s_kiss_needed = true;
+#endif
                 break;
             case EV_SESSION_CLOSE:
                 s_want_kiss = false;
+                s_kiss_needed = false;
+                xTimerStop(s_grace_timer, 0);
+                xSemaphoreTake(s_param_lock, portMAX_DELAY);
+                memset(s_params, 0, sizeof(s_params));
+                xSemaphoreGive(s_param_lock);
+                break;
+            case EV_KISS_NEEDED:
+                if (s_want_kiss && !s_kiss_needed) {
+                    s_kiss_needed = true;
+                    ESP_LOGI(TAG, "entering KISS: %s",
+                             msg.arg ? "app sent data" : "grace period over");
+                }
                 break;
             case EV_QSY:
             case EV_QSY_RESTORE:
@@ -590,6 +687,25 @@ static void dispatch_frame(const uint8_t *f, size_t n)
         handle_sethw(payload, len);
         return;
     }
+    const uint8_t cmd = f[1];
+    if (cmd == 0xFF) {
+        ESP_LOGW(TAG, "app sent KISS exit; ignored (the adapter manages KISS mode)");
+        return;
+    }
+    const uint8_t type = cmd & 0x0F;
+    if (type >= 1 && type <= 5 && n <= KISS_PARAM_MAXLEN) {
+        /* Channel-access parameter: keep it if KISS isn't up yet. */
+        xSemaphoreTake(s_param_lock, portMAX_DELAY);
+        if (!s_kiss_active) {
+            s_params[type].len = n;
+            memcpy(s_params[type].data, f, n);
+            xSemaphoreGive(s_param_lock);
+            return;
+        }
+        xSemaphoreGive(s_param_lock);
+    } else if (!s_kiss_active) {
+        post_arg(EV_KISS_NEEDED, 1); /* data needs the TNC; bring KISS up now */
+    }
     forward_to_radio(f, n);
 }
 
@@ -638,12 +754,22 @@ static void app_tx_task(void *arg)
 }
 #endif
 
+static void grace_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+    post_arg(EV_KISS_NEEDED, 0);
+}
+
 esp_err_t bridge_start(const char *ble_name)
 {
     s_events = xQueueCreate(16, sizeof(bridge_msg_t));
     s_flags = xEventGroupCreate();
     s_app_tx = xStreamBufferCreate(APP_TX_BUF_SIZE, 1);
-    ESP_RETURN_ON_FALSE(s_events && s_flags && s_app_tx, ESP_ERR_NO_MEM, TAG, "no memory");
+    s_param_lock = xSemaphoreCreateMutex();
+    s_grace_timer = xTimerCreate("kiss_grace", pdMS_TO_TICKS(KISS_GRACE_MS), pdFALSE, NULL,
+                                 grace_timer_cb);
+    ESP_RETURN_ON_FALSE(s_events && s_flags && s_app_tx && s_param_lock && s_grace_timer,
+                        ESP_ERR_NO_MEM, TAG, "no memory");
     ESP_RETURN_ON_ERROR(cat_init(), TAG, "cat_init");
 
     BaseType_t ok = xTaskCreate(control_task, "bridge", 4096, NULL, 6, NULL);
