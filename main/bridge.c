@@ -43,6 +43,27 @@ static const char *TAG = "bridge";
 #define NVS_KEY_ORIG_TN    "orig_tn"
 
 #define BIT_KISS_ACTIVE    BIT0
+#define BIT_QSY_DONE       BIT1
+
+#define KISS_FEND          0xC0
+#define KISS_FESC          0xDB
+#define KISS_TFEND         0xDC
+#define KISS_TFESC         0xDD
+#define KISS_CMD_SETHW     0x06
+#define KISS_FRAME_MAX     1100 /* > 2 * 329 + 2 escaped worst case */
+#define QSY_WAIT_MS        15000
+
+/*
+ * EXPERIMENT (CONFIG_KK_LINK_QSY_EXPERIMENT): frequency control as observed
+ * from RadioMail talking to an adapter named "B.B. Link". It sends KISS
+ * SetHardware frames:
+ *   C0 06 EA f3 f2 f1 f0 C0   QSY: set the TNC band to frequency f (Hz, big-endian)
+ *   C0 06 EB C0               sent before disconnecting; taken as "restore frequency"
+ *   C0 06 F4 00 C0            meaning unknown; logged and ignored
+ * The D750's own TNC ignores these, so the bridge translates them to CAT.
+ */
+#define SETHW_QSY          0xEA
+#define SETHW_QSY_RESTORE  0xEB
 
 static const uint8_t KISS_EXIT[] = { 0xC0, 0xFF, 0xC0 };
 
@@ -51,7 +72,14 @@ typedef enum {
     EV_USB_DOWN,
     EV_SESSION_OPEN,
     EV_SESSION_CLOSE,
+    EV_QSY,         /* arg: frequency in Hz */
+    EV_QSY_RESTORE,
 } bridge_event_t;
+
+typedef struct {
+    bridge_event_t type;
+    uint32_t arg;
+} bridge_msg_t;
 
 static QueueHandle_t s_events;
 static EventGroupHandle_t s_flags;
@@ -67,14 +95,25 @@ static bool s_want_kiss; /* an app is subscribed */
 static bool s_in_kiss;   /* we put the radio's TNC into KISS */
 static char s_orig_tn[16];
 static uint32_t s_dropped_to_app;
+static bool s_qsy_saved;     /* s_orig_vm / s_orig_fq hold the pre-QSY state */
+static char s_orig_vm[16];   /* e.g. "VM 1,1" */
+static char s_orig_fq[24];   /* e.g. "FQ 1,0144390000" (VFO frequency) */
 
 /* ---------- callbacks (other tasks' context) ---------- */
 
-static void post(bridge_event_t ev)
+static bool post_arg(bridge_event_t type, uint32_t arg)
 {
-    if (xQueueSend(s_events, &ev, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "event queue full, lost event %d", ev);
+    const bridge_msg_t msg = { .type = type, .arg = arg };
+    if (xQueueSend(s_events, &msg, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "event queue full, lost event %d", type);
+        return false;
     }
+    return true;
+}
+
+static void post(bridge_event_t type)
+{
+    post_arg(type, 0);
 }
 
 static void on_radio_rx(const uint8_t *data, size_t len, void *ctx)
@@ -298,6 +337,96 @@ static void restore_tnc(void)
     ESP_LOGI(TAG, "radio TNC mode restored: %s", s_orig_tn);
 }
 
+static char tnc_band(void)
+{
+    char mode, band;
+    return parse_tn(s_orig_tn, &mode, &band) ? band : '1';
+}
+
+/* CAT mode only. Put the band back to its pre-QSY frequency and VFO/memory mode. */
+static void qsy_restore_cat(void)
+{
+    if (!s_qsy_saved) {
+        return;
+    }
+    char reply[CAT_LINE_MAX];
+    if (cat_query(s_orig_fq, reply, sizeof(reply)) != ESP_OK || strcmp(reply, s_orig_fq) != 0) {
+        ESP_LOGE(TAG, "QSY restore: %s failed (%s)", s_orig_fq, reply);
+    }
+    if (s_orig_vm[strlen(s_orig_vm) - 1] != '0') { /* was not on the VFO */
+        if (cat_query(s_orig_vm, reply, sizeof(reply)) != ESP_OK || strcmp(reply, s_orig_vm) != 0) {
+            ESP_LOGE(TAG, "QSY restore: %s failed (%s)", s_orig_vm, reply);
+        }
+    }
+    ESP_LOGI(TAG, "QSY restored: %s, %s", s_orig_fq, s_orig_vm);
+    s_qsy_saved = false;
+}
+
+/* CAT mode only. Switch the TNC band to VFO and tune it to `hz`. */
+static bool qsy_set_cat(uint32_t hz)
+{
+    const char band = tnc_band();
+    char cmd[32], reply[CAT_LINE_MAX];
+
+    if (!s_qsy_saved) {
+        snprintf(cmd, sizeof(cmd), "VM %c", band);
+        if (cat_query(cmd, s_orig_vm, sizeof(s_orig_vm)) != ESP_OK ||
+            strncmp(s_orig_vm, "VM ", 3) != 0) {
+            ESP_LOGE(TAG, "QSY: cannot read %s (%s)", cmd, s_orig_vm);
+            return false;
+        }
+    }
+    /* FQ only works on a VFO. */
+    snprintf(cmd, sizeof(cmd), "VM %c,0", band);
+    if (cat_query(cmd, reply, sizeof(reply)) != ESP_OK || strcmp(reply, cmd) != 0) {
+        ESP_LOGE(TAG, "QSY: %s refused (%s)", cmd, reply);
+        return false;
+    }
+    if (!s_qsy_saved) {
+        snprintf(cmd, sizeof(cmd), "FQ %c", band);
+        if (cat_query(cmd, s_orig_fq, sizeof(s_orig_fq)) != ESP_OK ||
+            strncmp(s_orig_fq, "FQ ", 3) != 0) {
+            ESP_LOGE(TAG, "QSY: cannot read %s (%s)", cmd, s_orig_fq);
+            return false;
+        }
+        s_qsy_saved = true;
+        ESP_LOGI(TAG, "QSY: saved %s, %s", s_orig_vm, s_orig_fq);
+    }
+    snprintf(cmd, sizeof(cmd), "FQ %c,%010lu", band, (unsigned long)hz);
+    if (cat_query(cmd, reply, sizeof(reply)) != ESP_OK || strcmp(reply, cmd) != 0) {
+        ESP_LOGE(TAG, "QSY: %s refused (%s)", cmd, reply);
+        return false;
+    }
+    ESP_LOGI(TAG, "QSY: band %c now %lu.%06lu MHz", band == '0' ? 'A' : 'B',
+             (unsigned long)(hz / 1000000), (unsigned long)(hz % 1000000));
+    return true;
+}
+
+/* Leave KISS, run a CAT step, and go back into KISS. Control task only. */
+static void qsy_handle(bridge_event_t type, uint32_t hz)
+{
+    if (!s_usb_up || !s_radio_ok || !s_in_kiss) {
+        ESP_LOGW(TAG, "QSY ignored: no active KISS session");
+        return;
+    }
+    set_kiss_active(false);
+    send_kiss_exit();
+    s_in_kiss = false;
+    if (!wake_radio()) {
+        ESP_LOGE(TAG, "QSY: radio silent after KISS exit");
+        s_radio_ok = false;
+        return;
+    }
+    if (type == EV_QSY) {
+        qsy_set_cat(hz);
+    } else {
+        qsy_restore_cat();
+    }
+    if (s_want_kiss) {
+        enter_kiss();
+    }
+}
+
 static void leave_kiss(void)
 {
     set_kiss_active(false);
@@ -311,6 +440,7 @@ static void leave_kiss(void)
         s_radio_ok = false;
         return;
     }
+    qsy_restore_cat();
     restore_tnc();
     ESP_LOGI(TAG, "KISS off");
 }
@@ -336,9 +466,9 @@ static void control_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        bridge_event_t ev;
-        if (xQueueReceive(s_events, &ev, pdMS_TO_TICKS(RETRY_PERIOD_MS)) == pdTRUE) {
-            switch (ev) {
+        bridge_msg_t msg;
+        if (xQueueReceive(s_events, &msg, pdMS_TO_TICKS(RETRY_PERIOD_MS)) == pdTRUE) {
+            switch (msg.type) {
             case EV_USB_UP:
                 ESP_LOGI(TAG, "radio USB up");
                 s_usb_up = true;
@@ -357,6 +487,11 @@ static void control_task(void *arg)
             case EV_SESSION_CLOSE:
                 s_want_kiss = false;
                 break;
+            case EV_QSY:
+            case EV_QSY_RESTORE:
+                qsy_handle(msg.type, msg.arg);
+                xEventGroupSetBits(s_flags, BIT_QSY_DONE);
+                break;
             }
         } else if (s_usb_up && !s_radio_ok) {
             radio_bringup();
@@ -365,6 +500,103 @@ static void control_task(void *arg)
     }
 }
 
+/* Writes app bytes to the radio once KISS is up. app_tx task only. */
+static void forward_to_radio(const uint8_t *data, size_t len)
+{
+    EventBits_t bits = xEventGroupWaitBits(s_flags, BIT_KISS_ACTIVE, pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(APP_TX_WAIT_MS));
+    if (!(bits & BIT_KISS_ACTIVE)) {
+        ESP_LOGW(TAG, "KISS not active; dropped %u bytes from app", (unsigned)len);
+        return;
+    }
+    esp_err_t err = radio_usb_write(data, len, 2000);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "write to radio failed: %s", esp_err_to_name(err));
+    }
+}
+
+#if CONFIG_KK_LINK_QSY_EXPERIMENT
+/* Hand a CAT step to the control task and wait for it, so later frames are
+ * not written while the radio is out of KISS. */
+static void run_qsy_step(bridge_event_t type, uint32_t hz)
+{
+    xEventGroupClearBits(s_flags, BIT_QSY_DONE);
+    if (post_arg(type, hz)) {
+        xEventGroupWaitBits(s_flags, BIT_QSY_DONE, pdTRUE, pdFALSE, pdMS_TO_TICKS(QSY_WAIT_MS));
+    }
+}
+
+/* A SetHardware frame from the app: handle the ones we know, never pass to the radio. */
+static void handle_sethw(const uint8_t *p, size_t n)
+{
+    if (n >= 5 && p[0] == SETHW_QSY) {
+        uint32_t hz = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) |
+                      ((uint32_t)p[3] << 8) | p[4];
+        ESP_LOGI(TAG, "app QSY request: %lu Hz", (unsigned long)hz);
+        run_qsy_step(EV_QSY, hz);
+    } else if (n >= 1 && p[0] == SETHW_QSY_RESTORE) {
+        ESP_LOGI(TAG, "app QSY restore request");
+        run_qsy_step(EV_QSY_RESTORE, 0);
+    } else {
+        ESP_LOGI(TAG, "app SetHardware 0x%02x (%u bytes) ignored", n ? p[0] : 0, (unsigned)n);
+    }
+}
+
+/* One complete frame, FEND to FEND. */
+static void dispatch_frame(const uint8_t *f, size_t n)
+{
+    if (n >= 3 && (f[1] & 0x0F) == KISS_CMD_SETHW) {
+        uint8_t payload[16];
+        size_t len = 0;
+        bool esc = false;
+        for (size_t i = 2; i < n - 1 && len < sizeof(payload); i++) {
+            uint8_t c = f[i];
+            if (esc) {
+                payload[len++] = c == KISS_TFEND ? KISS_FEND : c == KISS_TFESC ? KISS_FESC : c;
+                esc = false;
+            } else if (c == KISS_FESC) {
+                esc = true;
+            } else {
+                payload[len++] = c;
+            }
+        }
+        handle_sethw(payload, len);
+        return;
+    }
+    forward_to_radio(f, n);
+}
+
+/* Reassemble KISS frames from the app's byte stream (frames may span writes). */
+static void app_tx_task(void *arg)
+{
+    (void)arg;
+    static uint8_t frame[KISS_FRAME_MAX];
+    size_t flen = 0; /* frame[0] is the opening FEND when flen > 0 */
+    uint8_t buf[256];
+    for (;;) {
+        size_t n = xStreamBufferReceive(s_app_tx, buf, sizeof(buf), portMAX_DELAY);
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t c = buf[i];
+            if (c == KISS_FEND) {
+                if (flen > 1) {
+                    frame[flen++] = KISS_FEND;
+                    dispatch_frame(frame, flen);
+                }
+                frame[0] = KISS_FEND; /* closing FEND doubles as the next opening */
+                flen = 1;
+            } else if (flen == 0) {
+                forward_to_radio(&c, 1); /* stray byte outside any frame */
+            } else if (flen < sizeof(frame) - 1) {
+                frame[flen++] = c;
+            } else {
+                ESP_LOGW(TAG, "KISS frame too long; passing through unparsed");
+                forward_to_radio(frame, flen);
+                flen = 0;
+            }
+        }
+    }
+}
+#else
 /* Moves app data to the radio once KISS is up. */
 static void app_tx_task(void *arg)
 {
@@ -372,25 +604,16 @@ static void app_tx_task(void *arg)
     uint8_t buf[256];
     for (;;) {
         size_t n = xStreamBufferReceive(s_app_tx, buf, sizeof(buf), portMAX_DELAY);
-        if (n == 0) {
-            continue;
-        }
-        EventBits_t bits = xEventGroupWaitBits(s_flags, BIT_KISS_ACTIVE, pdFALSE, pdFALSE,
-                                               pdMS_TO_TICKS(APP_TX_WAIT_MS));
-        if (!(bits & BIT_KISS_ACTIVE)) {
-            ESP_LOGW(TAG, "KISS not active; dropped %u bytes from app", (unsigned)n);
-            continue;
-        }
-        esp_err_t err = radio_usb_write(buf, n, 2000);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "write to radio failed: %s", esp_err_to_name(err));
+        if (n > 0) {
+            forward_to_radio(buf, n);
         }
     }
 }
+#endif
 
 esp_err_t bridge_start(const char *ble_name)
 {
-    s_events = xQueueCreate(16, sizeof(bridge_event_t));
+    s_events = xQueueCreate(16, sizeof(bridge_msg_t));
     s_flags = xEventGroupCreate();
     s_app_tx = xStreamBufferCreate(APP_TX_BUF_SIZE, 1);
     ESP_RETURN_ON_FALSE(s_events && s_flags && s_app_tx, ESP_ERR_NO_MEM, TAG, "no memory");

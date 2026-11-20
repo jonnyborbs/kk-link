@@ -17,4 +17,13 @@ menu "kk-link"
             characteristic. Useful to see what an app sends besides KISS
             data frames.
 
+    config KK_LINK_QSY_EXPERIMENT
+        bool "EXPERIMENT: translate app frequency requests (QSY) to CAT"
+        default n
+        help
+            Handle the KISS SetHardware frames RadioMail sends to adapters
+            named "B.B. Link" (0xEA = set frequency, 0xEB = restore). The
+            bridge leaves KISS, sets the TNC band's VFO frequency over CAT and
+            re-enters KISS. Observed behaviour, not a published protocol.
+
 endmenu
