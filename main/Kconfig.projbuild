@@ -2,7 +2,7 @@ menu "kk-link"
 
     config KK_LINK_BLE_NAME
         string "BLE device name"
-        default "K. K. Link"
+        default "K.K. Link"
         help
             Name the adapter advertises to BLE-KISS apps (max 29 bytes).
             RadioMail only enables frequency control (QSY) for adapters named

@@ -20,7 +20,7 @@
 
 static const char *TAG = "kk_link";
 
-/* Set in menuconfig ("kk-link"); defaults to "K. K. Link". */
+/* Set in menuconfig ("kk-link"); defaults to "K.K. Link". */
 #define BLE_DEVICE_NAME CONFIG_KK_LINK_BLE_NAME
 
 void app_main(void)

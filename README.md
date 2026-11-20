@@ -15,7 +15,7 @@ an independent implementation and shares no code with B.B. Link.
 
 Status: **milestone 2**, a working BLE-KISS bridge. Apps that speak the
 [BLE-KISS API](https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md)
-find the adapter as **"K. K. Link"**, and KISS frames flow both ways between the
+find the adapter as **"K.K. Link"**, and KISS frames flow both ways between the
 app and the radio's built-in TNC. Tested from a Mac BLE client (transmit, and
 receive of the digipeated echo); not yet tested with an iOS app.
 
@@ -39,7 +39,7 @@ receive of the digipeated echo); not yet tested with an iOS app.
 | TX | `00000002-ba2a-46c9-ae49-01b0961f68bb` | app → radio, write / write without response |
 | RX | `00000003-ba2a-46c9-ae49-01b0961f68bb` | radio → app, notify |
 
-The adapter name "K. K. Link" is a placeholder. RadioMail enables frequency
+The adapter name "K.K. Link" is a placeholder. RadioMail enables frequency
 control (QSY) only for adapters named "B.B. Link"; that name is not used
 without coordinating with Island Magic.
 
@@ -129,7 +129,7 @@ manager on the first build; NimBLE is part of ESP-IDF.
 Expected console output for one app session:
 
 ```
-I (...) ble_kiss: advertising as "K. K. Link"
+I (...) ble_kiss: advertising as "K.K. Link"
 I (...) bridge: radio answering (ID TM-D750) after 1 DTR pulse(s)
 I (...) bridge: radio TNC mode: TN 0,1
 I (...) ble_kiss: app subscribed: KISS session open
