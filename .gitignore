@@ -13,3 +13,7 @@ managed_components/
 .clangd
 *.swp
 .DS_Store
+
+# Local, untracked build overrides (e.g. sdkconfig.defaults.local)
+*.local
+build-*/

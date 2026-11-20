@@ -14,15 +14,14 @@
  * the radio over its main-unit USB port (CDC-ACM) as a USB host.
  */
 #include "bridge.h"
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "kk_link";
 
-/* Placeholder name. Note: RadioMail only enables frequency control (QSY) for
- * adapters named "B.B. Link"; do not use that name without coordinating with
- * Island Magic. */
-#define BLE_DEVICE_NAME "KK Link"
+/* Set in menuconfig ("kk-link"); defaults to "K. K. Link". */
+#define BLE_DEVICE_NAME CONFIG_KK_LINK_BLE_NAME
 
 void app_main(void)
 {

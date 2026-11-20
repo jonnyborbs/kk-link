@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "radio_usb.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "bridge";
 
@@ -98,6 +99,10 @@ static void on_radio_state(bool connected, void *ctx)
 static void on_app_rx(const uint8_t *data, size_t len, void *ctx)
 {
     (void)ctx;
+#if CONFIG_KK_LINK_LOG_APP_WRITES
+    ESP_LOGI(TAG, "app wrote %u bytes%s", (unsigned)len, s_kiss_active ? "" : " (KISS not active)");
+    ESP_LOG_BUFFER_HEXDUMP(TAG, data, len < 64 ? len : 64, ESP_LOG_INFO);
+#endif
     size_t n = xStreamBufferSend(s_app_tx, data, len, 0);
     if (n < len) {
         ESP_LOGW(TAG, "app TX buffer full, dropped %u bytes", (unsigned)(len - n));

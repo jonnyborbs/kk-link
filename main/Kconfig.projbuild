@@ -1,0 +1,20 @@
+menu "kk-link"
+
+    config KK_LINK_BLE_NAME
+        string "BLE device name"
+        default "K. K. Link"
+        help
+            Name the adapter advertises to BLE-KISS apps (max 29 bytes).
+            RadioMail only enables frequency control (QSY) for adapters named
+            "B.B. Link"; only use that name for local experiments until it is
+            coordinated with Island Magic.
+
+    config KK_LINK_LOG_APP_WRITES
+        bool "Log every write from the app (hex)"
+        default n
+        help
+            Log the first bytes of each write an app makes to the TX
+            characteristic. Useful to see what an app sends besides KISS
+            data frames.
+
+endmenu
