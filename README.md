@@ -43,6 +43,45 @@ The adapter name "K. K. Link" is a placeholder. RadioMail enables frequency
 control (QSY) only for adapters named "B.B. Link"; that name is not used
 without coordinating with Island Magic.
 
+### Experimental: frequency control (QSY)
+
+When RadioMail believes it is talking to a B.B. Link adapter, it sends its
+frequency changes in-band as KISS SetHardware (`0x06`) frames:
+
+| Frame | Observed meaning |
+| --- | --- |
+| `C0 06 EA f3 f2 f1 f0 C0` | set the TNC band to frequency `f` (Hz, big-endian) |
+| `C0 06 EB C0` | sent before disconnecting; treated as "restore frequency" |
+| `C0 06 F4 00 C0` | unknown; logged and ignored |
+
+These come from observing RadioMail, not from a published protocol. The
+D750's own TNC ignores them, so with `CONFIG_KK_LINK_QSY_EXPERIMENT` enabled
+(menuconfig → kk-link; off by default) the adapter translates them:
+- **On a QSY:** it leaves KISS, switches the TNC band to VFO mode
+  (`VM b,0`), sets the frequency (`FQ b,<Hz>`) and re-enters KISS (about 1 s;
+  app frames wait meanwhile).
+- **On restore or at the end of the session:** it puts back the band's
+  original VFO frequency and VFO/memory mode.
+- **If the adapter resets mid-session:** the TNC mode is restored, but the frequency is not.
+
+Because RadioMail only sends these to an adapter named "B.B. Link", testing
+needs a local build with that name. Keep it in a gitignored
+`sdkconfig.defaults.local`:
+
+```
+CONFIG_KK_LINK_BLE_NAME="B.B. Link"
+CONFIG_KK_LINK_QSY_EXPERIMENT=y
+CONFIG_KK_LINK_LOG_APP_WRITES=y
+```
+
+and build it into its own directory:
+
+```sh
+idf.py -B build-bblink -D SDKCONFIG=build-bblink/sdkconfig \
+  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.local" \
+  -p /dev/cu.usbmodemXXXX flash
+```
+
 ## Hardware
 
 - Espressif **ESP32-S3-DevKitC-1-N16R8** (16 MB flash, 8 MB octal PSRAM).
