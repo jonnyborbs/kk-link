@@ -84,10 +84,12 @@ idf.py -B build-bblink -D SDKCONFIG=build-bblink/sdkconfig \
 
 ## Hardware
 
-- Espressif **ESP32-S3-DevKitC-1-N16R8** (16 MB flash, 8 MB octal PSRAM).
+- Espressif **ESP32-S3-DevKitC-1-N16R8** (16 MB flash, 8 MB octal PSRAM),
+  available [on Amazon](https://link.amazon/B066pf0Qa).
 - **USB-OTG solder jumper bridged** on the DevKitC, so the board's 5 V feeds
   VBUS on the native USB port (needed for USB host mode).
-- DevKitC **"UART" USB-C port → computer**: power, flashing and console logs.
+- DevKitC **"UART" USB-C port** (labeled **"COM"** on some board versions)
+  **→ computer**: power, flashing and console logs.
 - DevKitC **"USB" (native) USB-C port → radio's main-unit USB port**.
 - **Kenwood TM-D750**: set menu **984 (KISS) = USB (Main Unit)** so the TNC's
   KISS port is the USB port (CAT works over USB with either setting). KISS runs
@@ -115,7 +117,7 @@ Requires ESP-IDF 5.5 (5.3 or newer should work).
 ```sh
 . ~/esp/esp-idf/export.sh
 idf.py build
-idf.py -p /dev/cu.usbmodemXXXX flash monitor   # the DevKitC "UART" port
+idf.py -p /dev/cu.usbmodemXXXX flash monitor   # the DevKitC "UART"/"COM" port
 ```
 
 `export.sh` must run with the same `python3` that `install.sh` used. On a Mac
