@@ -16,8 +16,15 @@ an independent implementation and shares no code with B.B. Link.
 Status: **milestone 2**, a working BLE-KISS bridge. Apps that speak the
 [BLE-KISS API](https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md)
 find the adapter as **"K.K. Link"**, and KISS frames flow both ways between the
-app and the radio's built-in TNC. Tested from a Mac BLE client (transmit, and
-receive of the digipeated echo); not yet tested with an iOS app.
+app and the radio's built-in TNC. Tested with RadioMail on iOS and from a Mac
+BLE client.
+
+## Download
+
+Ready-to-flash firmware is on the
+**[latest release page](https://github.com/jonnyborbs/kk-link/releases/latest)**,
+with step-by-step instructions for flashing it from a web browser. No
+development tools are needed.
 
 ## How it works
 
