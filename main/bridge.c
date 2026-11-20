@@ -300,8 +300,35 @@ static void radio_bringup(void)
     s_radio_ok = true;
 }
 
+/*
+ * Decide which TNC mode to restore when the session ends. The flash copy
+ * wins when it exists: it is set while a session is in progress (e.g. when
+ * re-entering KISS after a QSY) or left by an interrupted one. Otherwise read
+ * the radio now, so a mode the user changed on the radio since the adapter
+ * booted (say, APRS turned on) is what gets restored.
+ */
+static bool capture_orig_tn(void)
+{
+    char saved[sizeof(s_orig_tn)];
+    if (nvs_load_orig(saved, sizeof(saved))) {
+        strlcpy(s_orig_tn, saved, sizeof(s_orig_tn));
+        return true;
+    }
+    char reply[CAT_LINE_MAX], mode, band;
+    if (cat_query("TN", reply, sizeof(reply)) != ESP_OK || !parse_tn(reply, &mode, &band)) {
+        ESP_LOGE(TAG, "cannot read TNC mode (TN) at session start");
+        return false;
+    }
+    strlcpy(s_orig_tn, reply, sizeof(s_orig_tn));
+    ESP_LOGI(TAG, "session start: radio TNC mode %s", s_orig_tn);
+    return true;
+}
+
 static bool enter_kiss(void)
 {
+    if (!capture_orig_tn()) {
+        return false;
+    }
     char mode, band;
     if (!parse_tn(s_orig_tn, &mode, &band)) {
         band = '1';
