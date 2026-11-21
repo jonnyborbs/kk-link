@@ -11,6 +11,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -23,6 +24,8 @@ static const char *TAG = "radio_usb";
 #define OPEN_TIMEOUT_MS   1000 /* each cdc_acm_host_open() attempt waits this long */
 #define USB_IN_BUF_SIZE   512
 #define USB_OUT_BUF_SIZE  512
+#define PORT_REINIT_MS    60000 /* re-initialize the root port this often while the radio is absent */
+#define PORT_OFF_MS       200
 
 #define EVT_DISCONNECTED  BIT0
 
@@ -88,6 +91,7 @@ static void radio_usb_task(void *arg)
         .user_arg = NULL,
     };
     bool waiting_logged = false;
+    int64_t port_reinit_at = esp_timer_get_time();
 
     for (;;) {
         if (!waiting_logged) {
@@ -100,7 +104,21 @@ static void radio_usb_task(void *arg)
         esp_err_t err = cdc_acm_host_open(RADIO_USB_VID, RADIO_USB_PID, RADIO_USB_CDC_INTERFACE,
                                           &dev_config, &dev);
         if (err == ESP_ERR_NOT_FOUND) {
-            continue; /* not plugged in yet; open() already waited OPEN_TIMEOUT_MS */
+            /* Not there yet (open() already waited OPEN_TIMEOUT_MS). If it stays
+             * away, re-initialize the root port now and then: once, after a radio
+             * power-cycle, the radio only came back after an adapter reset. */
+            if (esp_timer_get_time() - port_reinit_at >= (int64_t)PORT_REINIT_MS * 1000) {
+                usb_host_lib_info_t info;
+                if (usb_host_lib_info(&info) == ESP_OK && info.num_devices == 0) {
+                    ESP_LOGI(TAG, "radio not seen for %d s; re-initializing the USB port",
+                             PORT_REINIT_MS / 1000);
+                    usb_host_lib_set_root_port_power(false);
+                    vTaskDelay(pdMS_TO_TICKS(PORT_OFF_MS));
+                    usb_host_lib_set_root_port_power(true);
+                }
+                port_reinit_at = esp_timer_get_time();
+            }
+            continue;
         }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "open failed: %s; retrying", esp_err_to_name(err));
@@ -149,6 +167,7 @@ static void radio_usb_task(void *arg)
         xSemaphoreGive(s_lock);
         cdc_acm_host_close(dev);
         ESP_LOGI(TAG, "radio port closed");
+        port_reinit_at = esp_timer_get_time(); /* give it PORT_REINIT_MS to come back */
 
         if (s_config.state_cb) {
             s_config.state_cb(false, s_config.ctx);

@@ -41,6 +41,10 @@ development tools are needed.
 - **Recovery:** KISS mode survives DTR drops and USB replugs. If the adapter
   resets or the cable drops mid-session, the next connection finds the radio
   silent on CAT, sends `C0 FF C0`, and restores the TNC mode saved in flash.
+- **Radio switched off and on:** the adapter waits for the radio to come back
+  on USB, which takes about 15–30 s after power-on, then reconnects on its own.
+  While the radio is absent, the adapter re-initializes its USB port every 60 s
+  as a safety net.
 
 | Characteristic | UUID | Direction |
 | --- | --- | --- |
