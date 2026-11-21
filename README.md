@@ -63,9 +63,9 @@ never passes them to the radio:
 | `C0 06 7E C0` Get capabilities | replies `C0 06 7E 08 00 C0` (`0x0800`: firmware-version query supported) |
 | `C0 06 EA f3 f2 f1 f0 C0` Set frequency | tunes the TNC band to `f` Hz (MSB first) via CAT |
 | `C0 06 EB C0` Restore frequency | puts back the band's frequency from before the first set |
+| `C0 06 F4 nn C0` Set baud rate (B.B. Link extension) | sets the TNC speed via CAT: `nn` = `00` for 1200 (`AS 0`), `01` for 9600 (`AS 1`) |
 
-Other SetHardware frames (RadioMail also sends `C0 06 F4 00 C0`) are logged
-and ignored. Replies are never inserted in the middle of a packet the radio is
+Other SetHardware frames are logged and ignored. Replies are never inserted in the middle of a packet the radio is
 sending to the app.
 
 **How frequency control works on the D750:** the radio doesn't answer CAT while
@@ -84,8 +84,11 @@ On restore, or when the app disconnects, it puts all three back:
   selected over CAT: switching the band back to memory mode returns it there.
 - **Check:** the adapter reads the band back and logs where it ended up.
 
+A baud-rate change works the same way: the adapter saves the TNC's original
+speed first and restores it when the app leaves.
+
 If the adapter resets or loses power mid-session, the next connection to the
-radio restores both the channel and the TNC mode.
+radio restores the channel, the TNC speed and the TNC mode.
 
 **RadioMail** currently sends frequency changes only to adapters named
 "B.B. Link". Testing that needs a local build with that name (see below).

@@ -50,6 +50,7 @@ static const char *TAG = "bridge";
 #define NVS_NAMESPACE      "qrvlink"
 #define NVS_KEY_ORIG_TN    "orig_tn"
 #define NVS_KEY_ORIG_QSY   "orig_qsy" /* "VM b,m;MR ccc;FQ b,f" saved before the first QSY */
+#define NVS_KEY_ORIG_AS    "orig_as"  /* "AS n" saved before the first baud-rate change */
 
 #define BIT_KISS_ACTIVE    BIT0
 #define BIT_QSY_DONE       BIT1
@@ -71,13 +72,16 @@ static const char *TAG = "bridge";
  *   C0 06 7E C0               Get capabilities     -> C0 06 7E <u16 MSB first> C0
  *   C0 06 EA f3 f2 f1 f0 C0   Set frequency f (Hz, MSB first) on the TNC band, via CAT
  *   C0 06 EB C0               Restore the frequency from before the first EA
- * Others (e.g. RadioMail's 06 F4 00) are logged and ignored.
+ *   C0 06 F4 nn C0            Set TNC baud rate: nn = 0 (1200) or 1 (9600), via CAT "AS"
+ *                             (B.B. Link's extension; restored when the app leaves)
+ * Others are logged and ignored.
  */
 #define SETHW_GET_FW_VERSION   0x28
 #define SETHW_GET_API_VERSION  0x7B
 #define SETHW_GET_CAPABILITIES 0x7E
 #define SETHW_QSY              0xEA
 #define SETHW_QSY_RESTORE      0xEB
+#define SETHW_SET_BAUD         0xF4
 
 #define QRV_API_VERSION        0x0100 /* major.minor of the command set above */
 #define CAP_FIRMWARE_VERSION   0x0800 /* bit meaning as defined by Mobilinkd */
@@ -94,6 +98,7 @@ typedef enum {
     EV_SESSION_CLOSE,
     EV_QSY,         /* arg: frequency in Hz */
     EV_QSY_RESTORE,
+    EV_SET_BAUD,    /* arg: AS value, 0 = 1200, 1 = 9600 */
     EV_KISS_NEEDED, /* arg: 0 = grace period over, 1 = app sent data */
 } bridge_event_t;
 
@@ -120,6 +125,8 @@ static bool s_qsy_saved;     /* s_orig_vm / _mr / _fq hold the pre-QSY state (al
 static char s_orig_vm[16];   /* e.g. "VM 1,1" (memory) or "VM 1,0" (VFO) */
 static char s_orig_mr[16];   /* e.g. "MR 012", "MR AP" (special channel), or "N" on the VFO */
 static char s_orig_fq[24];   /* e.g. "FQ 1,0144390000" (VFO frequency) */
+static bool s_baud_saved;    /* s_orig_as holds the pre-session TNC speed (also in NVS) */
+static char s_orig_as[8];    /* e.g. "AS 0" */
 static bool s_kiss_needed;   /* the session needs the TNC in KISS now (see lazy entry) */
 static TimerHandle_t s_grace_timer;
 
@@ -422,6 +429,10 @@ static void radio_bringup(void)
         strlcpy(s_orig_tn, reply, sizeof(s_orig_tn));
         ESP_LOGI(TAG, "radio TNC mode: %s", s_orig_tn);
     }
+    if (nvs_load_key(NVS_KEY_ORIG_AS, s_orig_as, sizeof(s_orig_as))) {
+        s_baud_saved = true;
+        ESP_LOGW(TAG, "recovering the TNC speed from an interrupted session: %s", s_orig_as);
+    }
     if (nvs_load_qsy()) {
         s_qsy_saved = true;
         ESP_LOGW(TAG, "recovering the band from an interrupted session: %s, %s, %s",
@@ -627,6 +638,44 @@ static bool qsy_set_cat(uint32_t hz)
     return true;
 }
 
+/* CAT mode only. Set the TNC speed (AS 0 = 1200, AS 1 = 9600), saving the original first. */
+static void baud_set_cat(uint32_t as_value)
+{
+    char cmd[8], reply[CAT_LINE_MAX];
+    if (!s_baud_saved) {
+        if (cat_query("AS", s_orig_as, sizeof(s_orig_as)) != ESP_OK ||
+            strncmp(s_orig_as, "AS ", 3) != 0) {
+            ESP_LOGE(TAG, "baud: cannot read AS (%s)", s_orig_as);
+            return;
+        }
+        s_baud_saved = true;
+        nvs_store_key(NVS_KEY_ORIG_AS, s_orig_as);
+    }
+    snprintf(cmd, sizeof(cmd), "AS %lu", (unsigned long)as_value);
+    if (cat_query(cmd, reply, sizeof(reply)) != ESP_OK || strcmp(reply, cmd) != 0) {
+        ESP_LOGE(TAG, "baud: %s refused (%s)", cmd, reply);
+        return;
+    }
+    ESP_LOGI(TAG, "TNC speed now %s baud (was %s)", as_value ? "9600" : "1200", s_orig_as);
+}
+
+/* CAT mode only. Put the TNC speed back if a session changed it. */
+static void baud_restore_cat(void)
+{
+    if (!s_baud_saved) {
+        return;
+    }
+    char reply[CAT_LINE_MAX];
+    if (cat_query("AS", reply, sizeof(reply)) == ESP_OK && strcmp(reply, s_orig_as) != 0 &&
+        (cat_query(s_orig_as, reply, sizeof(reply)) != ESP_OK || strcmp(reply, s_orig_as) != 0)) {
+        ESP_LOGE(TAG, "baud: could not restore %s (%s)", s_orig_as, reply);
+        return;
+    }
+    ESP_LOGI(TAG, "TNC speed restored: %s", s_orig_as);
+    s_baud_saved = false;
+    nvs_store_key(NVS_KEY_ORIG_AS, NULL);
+}
+
 /*
  * Run a QSY step over CAT. If KISS is on, leave it for the CAT step and go
  * back afterwards. With CONFIG_QRV_LINK_LAZY_KISS the radio is usually still in
@@ -637,17 +686,21 @@ static bool qsy_set_cat(uint32_t hz)
 static void qsy_handle(bridge_event_t type, uint32_t hz)
 {
     if (!s_usb_up || !s_radio_ok || !s_want_kiss) {
-        ESP_LOGW(TAG, "QSY ignored: no app session");
+        ESP_LOGW(TAG, "radio command ignored: no app session");
         return;
     }
     const bool was_kiss = s_in_kiss;
     if (was_kiss && !exit_kiss_to_cat()) {
-        ESP_LOGE(TAG, "QSY: radio silent after KISS exit");
+        ESP_LOGE(TAG, "radio silent after KISS exit");
         s_radio_ok = false;
         return;
     }
-    if (type == EV_QSY) {
-        qsy_set_cat(hz);
+    if (type == EV_QSY || type == EV_SET_BAUD) {
+        if (type == EV_QSY) {
+            qsy_set_cat(hz);
+        } else {
+            baud_set_cat(hz);
+        }
         if (was_kiss) {
             enter_kiss();
         }
@@ -676,6 +729,7 @@ static void leave_kiss(void)
         return;
     }
     qsy_restore_cat();
+    baud_restore_cat();
     restore_tnc();
     ESP_LOGI(TAG, "KISS off");
 }
@@ -692,6 +746,7 @@ static void reconcile(void)
     } else if (!s_want_kiss && !s_in_kiss) {
         /* Session over without KISS on (lazy entry), or an interrupted one. */
         qsy_restore_cat();
+        baud_restore_cat();
         char saved[sizeof(s_orig_tn)];
         if (nvs_load_orig(saved, sizeof(saved))) {
             restore_tnc();
@@ -748,6 +803,7 @@ static void control_task(void *arg)
                 break;
             case EV_QSY:
             case EV_QSY_RESTORE:
+            case EV_SET_BAUD:
                 qsy_handle(msg.type, msg.arg);
                 xEventGroupSetBits(s_flags, BIT_QSY_DONE);
                 break;
@@ -849,6 +905,9 @@ static void handle_sethw(const uint8_t *p, size_t n)
                       ((uint32_t)p[3] << 8) | p[4];
         ESP_LOGI(TAG, "app QSY request: %lu Hz", (unsigned long)hz);
         run_qsy_step(EV_QSY, hz);
+    } else if (n >= 2 && p[0] == SETHW_SET_BAUD && p[1] <= 1) {
+        ESP_LOGI(TAG, "app baud rate request: %s", p[1] ? "9600" : "1200");
+        run_qsy_step(EV_SET_BAUD, p[1]);
     } else if (n >= 1 && p[0] == SETHW_QSY_RESTORE) {
         ESP_LOGI(TAG, "app QSY restore request");
         run_qsy_step(EV_QSY_RESTORE, 0);
