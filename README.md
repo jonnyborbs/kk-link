@@ -13,11 +13,13 @@ packet apps to Kenwood radios over Bluetooth. QRV Link seeks to continue its
 legacy with new hardware for newly released radios such as the TM-D750. It is
 an independent implementation and shares no code with B.B. Link.
 
-Status: **milestone 2**, a working BLE-KISS bridge. Apps that speak the
+Status: **early test releases (0.0.x)**. Apps that speak the
 [BLE-KISS API](https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md)
 find the adapter as **"QRV Link"**, and KISS frames flow both ways between the
-app and the radio's built-in TNC. Tested with RadioMail on iOS and from a Mac
-BLE client.
+app and the radio's built-in TNC. The adapter also supports the
+[KISS hardware commands](#hardware-commands-kiss-sethardware) that apps use for
+frequency control, baud rate and version/capability queries. Tested with
+RadioMail and RadioMessenger on iOS and with a Mac BLE test client.
 
 ## Download
 
