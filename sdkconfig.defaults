@@ -1,4 +1,4 @@
-# kk-link defaults for ESP32-S3-DevKitC-1-N16R8
+# QRV Link defaults for ESP32-S3-DevKitC-1-N16R8
 CONFIG_IDF_TARGET="esp32s3"
 
 # 16 MB quad flash

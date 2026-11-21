@@ -1,28 +1,28 @@
-# kk-link
+# QRV Link
 
 ESP32-S3 firmware that bridges iOS packet/KISS apps over Bluetooth Low Energy
 to a Kenwood TM-D750 mobile radio over wired USB.
 
 The TM-D750 only accepts incoming Bluetooth connections while it is in Pairing
 Mode, so a Bluetooth SPP adapter can never reconnect to it. Its main-unit USB
-port is a standard CDC-ACM serial port, so kk-link talks to the radio over USB
+port is a standard CDC-ACM serial port, so QRV Link talks to the radio over USB
 and keeps BLE only on the app side.
 
-kk-link was inspired by Island Magic's [B.B. Link](https://getbblink.com) project, which connects iOS
-packet apps to Kenwood radios over Bluetooth. kk-link seeks to continue its
+QRV Link was inspired by Island Magic's [B.B. Link](https://getbblink.com) project, which connects iOS
+packet apps to Kenwood radios over Bluetooth. QRV Link seeks to continue its
 legacy with new hardware for newly released radios such as the TM-D750. It is
 an independent implementation and shares no code with B.B. Link.
 
 Status: **milestone 2**, a working BLE-KISS bridge. Apps that speak the
 [BLE-KISS API](https://github.com/hessu/aprs-specs/blob/master/BLE-KISS-API.md)
-find the adapter as **"K.K. Link"**, and KISS frames flow both ways between the
+find the adapter as **"QRV Link"**, and KISS frames flow both ways between the
 app and the radio's built-in TNC. Tested with RadioMail on iOS and from a Mac
 BLE client.
 
 ## Download
 
 Ready-to-flash firmware is on the
-**[latest release page](https://github.com/jonnyborbs/kk-link/releases/latest)**,
+**[latest release page](https://github.com/jonnyborbs/qrv-link/releases/latest)**,
 with step-by-step instructions for flashing it from a web browser. No
 development tools are needed.
 
@@ -46,7 +46,8 @@ development tools are needed.
 | TX | `00000002-ba2a-46c9-ae49-01b0961f68bb` | app → radio, write / write without response |
 | RX | `00000003-ba2a-46c9-ae49-01b0961f68bb` | radio → app, notify |
 
-The adapter name "K.K. Link" is a placeholder. RadioMail enables frequency
+The adapter advertises as "QRV Link" (QRV is the Q-code for "I am ready").
+RadioMail enables frequency
 control (QSY) only for adapters named "B.B. Link"; that name is not used
 without coordinating with Island Magic.
 
@@ -62,8 +63,8 @@ frequency changes in-band as KISS SetHardware (`0x06`) frames:
 | `C0 06 F4 00 C0` | unknown; logged and ignored |
 
 These come from observing RadioMail, not from a published protocol. The
-D750's own TNC ignores them, so with `CONFIG_KK_LINK_QSY_EXPERIMENT` enabled
-(menuconfig → kk-link; off by default) the adapter translates them:
+D750's own TNC ignores them, so with `CONFIG_QRV_LINK_QSY_EXPERIMENT` enabled
+(menuconfig → QRV Link; off by default) the adapter translates them:
 - **On a QSY:** it leaves KISS, switches the TNC band to VFO mode
   (`VM b,0`), sets the frequency (`FQ b,<Hz>`) and re-enters KISS (about 1 s;
   app frames wait meanwhile).
@@ -82,9 +83,9 @@ needs a local build with that name. Keep it in a gitignored
 `sdkconfig.defaults.local`:
 
 ```
-CONFIG_KK_LINK_BLE_NAME="B.B. Link"
-CONFIG_KK_LINK_QSY_EXPERIMENT=y
-CONFIG_KK_LINK_LOG_APP_WRITES=y
+CONFIG_QRV_LINK_BLE_NAME="B.B. Link"
+CONFIG_QRV_LINK_QSY_EXPERIMENT=y
+CONFIG_QRV_LINK_LOG_APP_WRITES=y
 ```
 
 and build it into its own directory:
@@ -117,7 +118,7 @@ Audio (ignored).
 The radio only reads and answers its USB serial port while the host holds
 **DTR high**, and only after DTR **rises once the radio is ready**. Asserting
 DTR right after enumeration is not enough: the radio silently ignores the port
-(writes stall after two packets). kk-link therefore opens the port with DTR
+(writes stall after two packets). QRV Link therefore opens the port with DTR
 low, waits briefly, then pulses DTR low → high and probes with `ID` until the
 radio answers (normally on the first pulse). The radio confirms with a CDC
 serial-state notification (DCD + DSR). RTS and line coding don't matter. This
@@ -144,7 +145,7 @@ manager on the first build; NimBLE is part of ESP-IDF.
 Expected console output for one app session:
 
 ```
-I (...) ble_kiss: advertising as "K.K. Link"
+I (...) ble_kiss: advertising as "QRV Link"
 I (...) bridge: radio answering (ID TM-D750) after 1 DTR pulse(s)
 I (...) bridge: radio TNC mode: TN 0,1
 I (...) ble_kiss: app subscribed: KISS session open
@@ -164,5 +165,5 @@ I (...) bridge: KISS off
 
 ## License
 
-kk-link is licensed under the [Mozilla Public License 2.0](LICENSE)
+QRV Link is licensed under the [Mozilla Public License 2.0](LICENSE)
 (SPDX: `MPL-2.0`).

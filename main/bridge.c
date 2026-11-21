@@ -46,7 +46,7 @@ static const char *TAG = "bridge";
 #define APP_TX_BUF_SIZE    4096 /* app -> radio; several queued frames */
 #define APP_TX_WAIT_MS     5000 /* how long app data may wait for KISS to come up */
 
-#define NVS_NAMESPACE      "kklink"
+#define NVS_NAMESPACE      "qrvlink"
 #define NVS_KEY_ORIG_TN    "orig_tn"
 
 #define BIT_KISS_ACTIVE    BIT0
@@ -61,7 +61,7 @@ static const char *TAG = "bridge";
 #define QSY_WAIT_MS        15000
 
 /*
- * EXPERIMENT (CONFIG_KK_LINK_QSY_EXPERIMENT): frequency control as observed
+ * EXPERIMENT (CONFIG_QRV_LINK_QSY_EXPERIMENT): frequency control as observed
  * from RadioMail talking to an adapter named "B.B. Link". It sends KISS
  * SetHardware frames:
  *   C0 06 EA f3 f2 f1 f0 C0   QSY: set the TNC band to frequency f (Hz, big-endian)
@@ -163,7 +163,7 @@ static void on_radio_state(bool connected, void *ctx)
 static void on_app_rx(const uint8_t *data, size_t len, void *ctx)
 {
     (void)ctx;
-#if CONFIG_KK_LINK_LOG_APP_WRITES
+#if CONFIG_QRV_LINK_LOG_APP_WRITES
     ESP_LOGI(TAG, "app wrote %u bytes%s", (unsigned)len, s_kiss_active ? "" : " (KISS not active)");
     ESP_LOG_BUFFER_HEXDUMP(TAG, data, len < 64 ? len : 64, ESP_LOG_INFO);
 #endif
@@ -495,7 +495,7 @@ static bool qsy_set_cat(uint32_t hz)
 
 static void restart_grace_timer(void)
 {
-#if CONFIG_KK_LINK_QSY_EXPERIMENT
+#if CONFIG_QRV_LINK_QSY_EXPERIMENT
     xTimerReset(s_grace_timer, 0);
 #endif
 }
@@ -585,7 +585,7 @@ static void control_task(void *arg)
                 break;
             case EV_SESSION_OPEN:
                 s_want_kiss = true;
-#if CONFIG_KK_LINK_QSY_EXPERIMENT
+#if CONFIG_QRV_LINK_QSY_EXPERIMENT
                 /* Lazy entry: a QSY usually follows within ~2 s and needs CAT,
                  * so don't switch to KISS until the app sends data or the
                  * grace period ends. */
@@ -639,7 +639,7 @@ static void forward_to_radio(const uint8_t *data, size_t len)
     }
 }
 
-#if CONFIG_KK_LINK_QSY_EXPERIMENT
+#if CONFIG_QRV_LINK_QSY_EXPERIMENT
 /* Hand a CAT step to the control task and wait for it, so later frames are
  * not written while the radio is out of KISS. */
 static void run_qsy_step(bridge_event_t type, uint32_t hz)
