@@ -9,6 +9,7 @@
 
 #include "ble_kiss.h"
 
+#include <stdio.h>
 #include <string.h>
 #include "esp_check.h"
 #include "esp_log.h"
@@ -35,7 +36,10 @@ static const ble_uuid128_t s_rx_uuid = KTS_UUID(0x03);
 #define NOTIFY_BUF_SIZE   2048
 #define NOTIFY_CHUNK_MAX  244 /* ATT MTU 247 - 3 */
 
+#define CAPS_DESC_LABEL   "Write KISS data"
+
 static ble_kiss_config_t s_config;
+static char s_caps_desc[24]; /* "Write KISS data:01" */
 static uint16_t s_rx_val_handle;
 static uint8_t s_own_addr_type;
 static StreamBufferHandle_t s_notify_buf;
@@ -88,6 +92,21 @@ static int chr_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 }
 
+/* TX characteristic User Description (0x2901): label + ":" + capability bitmask. */
+static int caps_desc_access(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_DSC) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return os_mbuf_append(ctxt->om, s_caps_desc, strlen(s_caps_desc)) == 0
+               ? 0
+               : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
 static const struct ble_gatt_svc_def s_services[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -97,6 +116,14 @@ static const struct ble_gatt_svc_def s_services[] = {
                 .uuid = &s_tx_uuid.u,
                 .access_cb = chr_access,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                    {
+                        .uuid = BLE_UUID16_DECLARE(0x2901),
+                        .att_flags = BLE_ATT_F_READ,
+                        .access_cb = caps_desc_access,
+                    },
+                    { 0 },
+                },
             },
             {
                 .uuid = &s_rx_uuid.u,
@@ -264,6 +291,8 @@ esp_err_t ble_kiss_start(const ble_kiss_config_t *config)
 {
     ESP_RETURN_ON_FALSE(config && config->device_name, ESP_ERR_INVALID_ARG, TAG, "bad config");
     s_config = *config;
+    snprintf(s_caps_desc, sizeof(s_caps_desc), "%s:%02X", CAPS_DESC_LABEL, config->capabilities);
+    ESP_LOGI(TAG, "capability descriptor: \"%s\"", s_caps_desc);
 
     s_notify_buf = xStreamBufferCreate(NOTIFY_BUF_SIZE, 1);
     ESP_RETURN_ON_FALSE(s_notify_buf, ESP_ERR_NO_MEM, TAG, "notify buffer");

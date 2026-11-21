@@ -48,6 +48,13 @@ development tools are needed.
 
 The adapter advertises as "QRV Link" (QRV is the Q-code for "I am ready").
 
+**Capabilities declared during discovery:** the TX characteristic carries a
+Characteristic User Description descriptor (`0x2901`) reading
+**`Write KISS data:01`**, a convention from Island Magic. The text after the
+colon is a hex bitmask of capabilities; `0x01` means the adapter supports
+frequency control (QSY). Apps read it while discovering the service, before any
+KISS traffic, so they don't need to rely on the adapter's name.
+
 ### Hardware commands (KISS SetHardware)
 
 The adapter supports every command listed in

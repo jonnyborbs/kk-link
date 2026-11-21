@@ -13,6 +13,7 @@
  *
  * Service  00000001-ba2a-46c9-ae49-01b0961f68bb
  *   TX     00000002-...  app -> TNC, write / write without response
+ *          descriptor 0x2901 "Write KISS data:XX": XX = capability bitmask (hex)
  *   RX     00000003-...  TNC -> app, notify
  *
  * The byte streams are passed through unchanged: KISS framing is end to end
@@ -35,8 +36,16 @@ typedef void (*ble_kiss_rx_cb_t)(const uint8_t *data, size_t len, void *ctx);
  * unsubscribes / disconnects (false). */
 typedef void (*ble_kiss_session_cb_t)(bool active, void *ctx);
 
+/*
+ * Capability bits declared in the TX characteristic's User Description
+ * descriptor (0x2901) as "Write KISS data:XX", a convention from Island Magic
+ * (RadioMail / B.B. Link). Apps read it during discovery.
+ */
+#define BLE_KISS_CAP_QSY  0x01 /* SetHardware 0xEA / 0xEB frequency control */
+
 typedef struct {
     const char *device_name;
+    uint8_t capabilities;      /* BLE_KISS_CAP_* bits */
     ble_kiss_rx_cb_t rx_cb;
     ble_kiss_session_cb_t session_cb;
     void *ctx;

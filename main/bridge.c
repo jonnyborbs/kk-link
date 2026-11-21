@@ -1023,6 +1023,7 @@ esp_err_t bridge_start(const char *ble_name)
 
     const ble_kiss_config_t ble_config = {
         .device_name = ble_name,
+        .capabilities = BLE_KISS_CAP_QSY, /* 0xEA/0xEB are handled (translated to CAT) */
         .rx_cb = on_app_rx,
         .session_cb = on_app_session,
     };
