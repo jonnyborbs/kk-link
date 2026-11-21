@@ -17,3 +17,6 @@ managed_components/
 # Local, untracked build overrides (e.g. sdkconfig.defaults.local)
 *.local
 build-*/
+
+# Merged firmware images (CI writes them at the repo root)
+qrv-link-*-esp32s3.bin

@@ -1,0 +1,115 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ESP_IDF_VERSION: v5.5.6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags, for git describe
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(git describe --tags --always)"
+            version="${version#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      # The same build as a release: repo defaults only (no local overrides),
+      # merged into one image for flash address 0x0.
+      - name: Build with ESP-IDF ${{ env.ESP_IDF_VERSION }} for esp32s3
+        uses: espressif/esp-idf-ci-action@v1.2.0
+        with:
+          esp_idf_version: ${{ env.ESP_IDF_VERSION }}
+          target: esp32s3
+          command: >-
+            idf.py -B build-release -D SDKCONFIG=build-release/sdkconfig
+            -D SDKCONFIG_DEFAULTS=sdkconfig.defaults
+            -D PROJECT_VER=${{ steps.version.outputs.version }} build &&
+            cd build-release &&
+            python -m esptool --chip esp32s3 merge_bin
+            -o ../qrv-link-${{ steps.version.outputs.version }}-esp32s3.bin @flash_args
+
+      - name: Check the image
+        env:
+          BIN: qrv-link-${{ steps.version.outputs.version }}-esp32s3.bin
+        run: |
+          set -euo pipefail
+          grep -qx 'CONFIG_QRV_LINK_BLE_NAME="QRV Link"' build-release/sdkconfig
+          grep -qx '# CONFIG_QRV_LINK_LAZY_KISS is not set' build-release/sdkconfig
+          grep -qx '# CONFIG_QRV_LINK_LOG_APP_WRITES is not set' build-release/sdkconfig
+          grep -aqF 'QRV Link' "$BIN"
+          if grep -aqF 'B.B. Link' "$BIN"; then
+            echo "::error::image contains the B.B. Link test name"
+            exit 1
+          fi
+          sha=$(sha256sum "$BIN" | cut -d' ' -f1)
+          {
+            echo "### \`$BIN\`"
+            echo
+            echo "- Size: $(stat -c %s "$BIN") bytes"
+            echo "- SHA-256: \`$sha\`"
+            echo "- Flash at address \`0x0\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qrv-link-${{ steps.version.outputs.version }}-esp32s3
+          path: qrv-link-${{ steps.version.outputs.version }}-esp32s3.bin
+          if-no-files-found: error
+
+  # On a version tag: attach the image to a draft release. Write the notes,
+  # then publish it. An existing release that already has the file is left alone.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: qrv-link-${{ needs.build.outputs.version }}-esp32s3
+          path: dist
+
+      - name: Attach the image to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          BIN: dist/qrv-link-${{ needs.build.outputs.version }}-esp32s3.bin
+        run: |
+          set -euo pipefail
+          name=$(basename "$BIN")
+          sha=$(sha256sum "$BIN" | cut -d' ' -f1)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+                | grep -qx "$name"; then
+              echo "Release $TAG already has $name; leaving it alone."
+            else
+              gh release upload "$TAG" "$BIN" -R "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$TAG" "$BIN" -R "$GITHUB_REPOSITORY" --draft \
+              --title "QRV Link ${TAG#v}" \
+              --notes "Draft created by the build workflow. SHA-256 of \`$name\`: \`$sha\`. Write the release notes, then publish."
+          fi

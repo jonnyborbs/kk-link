@@ -1,5 +1,7 @@
 # QRV Link
 
+[![Build firmware](https://github.com/jonnyborbs/qrv-link/actions/workflows/build.yml/badge.svg)](https://github.com/jonnyborbs/qrv-link/actions/workflows/build.yml)
+
 ESP32-S3 firmware that bridges iOS packet/KISS apps over Bluetooth Low Energy
 to a Kenwood TM-D750 mobile radio over wired USB.
 
@@ -194,6 +196,30 @@ I (...) ble_kiss: app gone: KISS session closed
 I (...) bridge: radio TNC mode restored: TN 0,1
 I (...) bridge: KISS off
 ```
+
+### Continuous builds and releases
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the
+firmware with ESP-IDF v5.5.6 on every push to `main` and every pull request.
+It uses the repo defaults only (no local overrides), merges the image for flash
+address `0x0`, and checks that the image advertises "QRV Link" with the
+optional features off. Each run's summary shows the image's SHA-256, and the
+image can be downloaded as a run artifact.
+
+To make a release:
+1. Push a signed version tag:
+
+   ```sh
+   git tag -s v0.0.6 -m "QRV Link 0.0.6" && git push origin v0.0.6
+   ```
+2. The workflow builds that tag and creates a **draft** release with
+   `qrv-link-0.0.6-esp32s3.bin` attached.
+3. Write the release notes (quote the SHA-256 from the run summary), then
+   publish.
+
+ESP-IDF stamps the build time into the image, so locally built images never
+match the CI image byte for byte. Release notes should quote the SHA-256 of the
+attached file.
 
 ## References
 
