@@ -47,6 +47,14 @@ development tools are needed.
   on USB, which takes about 15–30 s after power-on, then reconnects on its own.
   While the radio is absent, the adapter re-initializes its USB port every 60 s
   as a safety net.
+- **Apps that stay connected:** iOS shares one Bluetooth connection among all
+  apps, and the adapter keeps the TNC in KISS for as long as *any* app is
+  connected. The D750's TNC can't run its own APRS and serve KISS at the same
+  time. An app that stays connected in the background, such as an APRS app like
+  RadioMessenger, therefore keeps your radio in KISS mode after another app
+  (say, RadioMail) has finished. Some apps also reconnect on their own. To get
+  your radio's own APRS mode back, quit the apps using the adapter; the adapter
+  restores your settings as soon as the last one leaves.
 
 | Characteristic | UUID | Direction |
 | --- | --- | --- |
