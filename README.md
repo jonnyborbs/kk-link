@@ -47,44 +47,68 @@ development tools are needed.
 | RX | `00000003-ba2a-46c9-ae49-01b0961f68bb` | radio → app, notify |
 
 The adapter advertises as "QRV Link" (QRV is the Q-code for "I am ready").
-RadioMail enables frequency
-control (QSY) only for adapters named "B.B. Link"; that name is not used
-without coordinating with Island Magic.
 
-### Experimental: frequency control (QSY)
+### Hardware commands (KISS SetHardware)
 
-When RadioMail believes it is talking to a B.B. Link adapter, it sends its
-frequency changes in-band as KISS SetHardware (`0x06`) frames:
+The adapter supports every command listed in
+[kiss-tnc-hw-cmd](https://github.com/islandmagic/kiss-tnc-hw-cmd), the
+KISS SetHardware (`0x06`) command list Island Magic maintains. The D750's own
+TNC ignores these frames, so the adapter answers or translates them itself and
+never passes them to the radio:
 
-| Frame | Observed meaning |
+| Frame from the app | What the adapter does |
 | --- | --- |
-| `C0 06 EA f3 f2 f1 f0 C0` | set the TNC band to frequency `f` (Hz, big-endian) |
-| `C0 06 EB C0` | sent before disconnecting; treated as "restore frequency" |
-| `C0 06 F4 00 C0` | unknown; logged and ignored |
+| `C0 06 28 C0` Get firmware version | replies `C0 06 28 <version> C0`, e.g. `0.0.4` |
+| `C0 06 7B C0` Get API version | replies `C0 06 7B 01 00 C0` (1.0) |
+| `C0 06 7E C0` Get capabilities | replies `C0 06 7E 08 00 C0` (`0x0800`: firmware-version query supported) |
+| `C0 06 EA f3 f2 f1 f0 C0` Set frequency | tunes the TNC band to `f` Hz (MSB first) via CAT |
+| `C0 06 EB C0` Restore frequency | puts back the band's frequency from before the first set |
 
-These come from observing RadioMail, not from a published protocol. The
-D750's own TNC ignores them, so with `CONFIG_QRV_LINK_QSY_EXPERIMENT` enabled
-(menuconfig → QRV Link; off by default) the adapter translates them:
-- **On a QSY:** it leaves KISS, switches the TNC band to VFO mode
-  (`VM b,0`), sets the frequency (`FQ b,<Hz>`) and re-enters KISS (about 1 s;
-  app frames wait meanwhile).
-- **On restore or at the end of the session:** it puts back the band's
-  original VFO frequency and VFO/memory mode.
-- **If the adapter resets mid-session:** the TNC mode is restored, but the frequency is not.
-- **Deferred KISS switch:** because the QSY usually arrives about 2 s after the app connects
-  and needs CAT, the experiment build waits before switching the TNC to KISS. It
-  switches on the app's first data frame, or after 3 s if the app sends nothing
-  (listen-only apps miss packets during those 3 s). KISS parameter frames sent
-  before the switch are replayed to the TNC. After a restore (`EB`) it stays in
-  CAT mode until the app sends data again.
+Other SetHardware frames (RadioMail also sends `C0 06 F4 00 C0`) are logged
+and ignored. Replies are never inserted in the middle of a packet the radio is
+sending to the app.
 
-Because RadioMail only sends these to an adapter named "B.B. Link", testing
-needs a local build with that name. Keep it in a gitignored
-`sdkconfig.defaults.local`:
+**How frequency control works on the D750:** the radio doesn't answer CAT while
+its TNC is in KISS mode. On a set-frequency command the adapter:
+1. leaves KISS (`C0 FF C0`), which takes about 50 ms;
+2. switches the TNC band to VFO mode (`VM b,0`) and sets the frequency (`FQ b,<Hz>`);
+3. goes back to KISS.
+
+App frames wait meanwhile. Before the first frequency change the adapter
+saves the band's VFO/memory mode, memory channel and VFO frequency, both in RAM
+and in flash.
+
+On restore, or when the app disconnects, it puts all three back:
+- **Numbered memory channel:** re-selected explicitly (`MR b,nnn`).
+- **Special channel** such as the D750's APRS channel (`MR AP`), which can't be
+  selected over CAT: switching the band back to memory mode returns it there.
+- **Check:** the adapter reads the band back and logs where it ended up.
+
+If the adapter resets or loses power mid-session, the next connection to the
+radio restores both the channel and the TNC mode.
+
+**RadioMail** currently sends frequency changes only to adapters named
+"B.B. Link". Testing that needs a local build with that name (see below).
+Don't distribute such a build without coordinating with Island Magic.
+
+### Optional: deferred KISS switch
+
+With `CONFIG_QRV_LINK_LAZY_KISS` (menuconfig → QRV Link; off by default) the
+adapter waits before switching the TNC to KISS when an app connects. It
+switches on the app's first data frame, or after 3 s if the app sends nothing.
+A frequency change that arrives first, as RadioMail's does about 2 s after
+connecting, then needs no KISS exit. The trade-off is that listen-only apps
+miss packets during those 3 s. KISS parameter frames sent before the switch
+are replayed to the TNC. After a restore (`EB`) the adapter stays in CAT mode
+until the app sends data again.
+
+### Local test build named "B.B. Link"
+
+Keep the overrides in a gitignored `sdkconfig.defaults.local`:
 
 ```
 CONFIG_QRV_LINK_BLE_NAME="B.B. Link"
-CONFIG_QRV_LINK_QSY_EXPERIMENT=y
+CONFIG_QRV_LINK_LAZY_KISS=y
 CONFIG_QRV_LINK_LOG_APP_WRITES=y
 ```
 

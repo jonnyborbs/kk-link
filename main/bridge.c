@@ -15,6 +15,7 @@
 #include <string.h>
 #include "ble_kiss.h"
 #include "cat.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -48,6 +49,7 @@ static const char *TAG = "bridge";
 
 #define NVS_NAMESPACE      "qrvlink"
 #define NVS_KEY_ORIG_TN    "orig_tn"
+#define NVS_KEY_ORIG_QSY   "orig_qsy" /* "VM b,m;MR ccc;FQ b,f" saved before the first QSY */
 
 #define BIT_KISS_ACTIVE    BIT0
 #define BIT_QSY_DONE       BIT1
@@ -61,16 +63,27 @@ static const char *TAG = "bridge";
 #define QSY_WAIT_MS        15000
 
 /*
- * EXPERIMENT (CONFIG_QRV_LINK_QSY_EXPERIMENT): frequency control as observed
- * from RadioMail talking to an adapter named "B.B. Link". It sends KISS
- * SetHardware frames:
- *   C0 06 EA f3 f2 f1 f0 C0   QSY: set the TNC band to frequency f (Hz, big-endian)
- *   C0 06 EB C0               sent before disconnecting; taken as "restore frequency"
- *   C0 06 F4 00 C0            meaning unknown; logged and ignored
- * The D750's own TNC ignores these, so the bridge translates them to CAT.
+ * KISS SetHardware (0x06) sub-commands, as listed in
+ * https://github.com/islandmagic/kiss-tnc-hw-cmd. The D750's own TNC ignores
+ * them, so the adapter handles every 0x06 frame itself:
+ *   C0 06 28 C0               Get firmware version -> C0 06 28 <string> C0
+ *   C0 06 7B C0               Get API version      -> C0 06 7B <u16 MSB first> C0
+ *   C0 06 7E C0               Get capabilities     -> C0 06 7E <u16 MSB first> C0
+ *   C0 06 EA f3 f2 f1 f0 C0   Set frequency f (Hz, MSB first) on the TNC band, via CAT
+ *   C0 06 EB C0               Restore the frequency from before the first EA
+ * Others (e.g. RadioMail's 06 F4 00) are logged and ignored.
  */
-#define SETHW_QSY          0xEA
-#define SETHW_QSY_RESTORE  0xEB
+#define SETHW_GET_FW_VERSION   0x28
+#define SETHW_GET_API_VERSION  0x7B
+#define SETHW_GET_CAPABILITIES 0x7E
+#define SETHW_QSY              0xEA
+#define SETHW_QSY_RESTORE      0xEB
+
+#define QRV_API_VERSION        0x0100 /* major.minor of the command set above */
+#define CAP_FIRMWARE_VERSION   0x0800 /* bit meaning as defined by Mobilinkd */
+#define QRV_CAPABILITIES       (CAP_FIRMWARE_VERSION)
+
+#define REPLY_BOUNDARY_WAIT_MS 300 /* max wait for a radio frame to finish before replying */
 
 static const uint8_t KISS_EXIT[] = { 0xC0, 0xFF, 0xC0 };
 
@@ -103,8 +116,9 @@ static bool s_want_kiss; /* an app is subscribed */
 static bool s_in_kiss;   /* we put the radio's TNC into KISS */
 static char s_orig_tn[16];
 static uint32_t s_dropped_to_app;
-static bool s_qsy_saved;     /* s_orig_vm / s_orig_fq hold the pre-QSY state */
-static char s_orig_vm[16];   /* e.g. "VM 1,1" */
+static bool s_qsy_saved;     /* s_orig_vm / _mr / _fq hold the pre-QSY state (also in NVS) */
+static char s_orig_vm[16];   /* e.g. "VM 1,1" (memory) or "VM 1,0" (VFO) */
+static char s_orig_mr[16];   /* e.g. "MR 012", "MR AP" (special channel), or "N" on the VFO */
 static char s_orig_fq[24];   /* e.g. "FQ 1,0144390000" (VFO frequency) */
 static bool s_kiss_needed;   /* the session needs the TNC in KISS now (see lazy entry) */
 static TimerHandle_t s_grace_timer;
@@ -141,11 +155,25 @@ static void post(bridge_event_t type)
     post_arg(type, 0);
 }
 
+/*
+ * Everything sent to the app goes through s_to_app_lock, so adapter replies
+ * and radio bytes never interleave. s_radio_mid_frame is true while the radio
+ * stream to the app has an open KISS frame (the last chunk did not end on a
+ * FEND); replies wait for it to close.
+ */
+static SemaphoreHandle_t s_to_app_lock;
+static bool s_radio_mid_frame;
+
 static void on_radio_rx(const uint8_t *data, size_t len, void *ctx)
 {
     (void)ctx;
     if (s_kiss_active) {
+        xSemaphoreTake(s_to_app_lock, portMAX_DELAY);
         size_t sent = ble_kiss_send(data, len);
+        if (len > 0) {
+            s_radio_mid_frame = data[len - 1] != 0xC0;
+        }
+        xSemaphoreGive(s_to_app_lock);
         if (sent < len) {
             s_dropped_to_app += len - sent;
         }
@@ -179,41 +207,86 @@ static void on_app_session(bool active, void *ctx)
     post(active ? EV_SESSION_OPEN : EV_SESSION_CLOSE);
 }
 
-/* ---------- NVS: original TNC mode ---------- */
+/* ---------- NVS: radio state to restore after an interrupted session ---------- */
 
-static bool nvs_load_orig(char *out, size_t size)
+static bool nvs_load_key(const char *key, char *out, size_t size)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
         return false;
     }
     size_t len = size;
-    esp_err_t err = nvs_get_str(h, NVS_KEY_ORIG_TN, out, &len);
+    esp_err_t err = nvs_get_str(h, key, out, &len);
     nvs_close(h);
     return err == ESP_OK;
 }
 
-static void nvs_store_orig(const char *value)
+/* value NULL erases the key. */
+static void nvs_store_key(const char *key, const char *value)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
         return;
     }
     if (value) {
-        nvs_set_str(h, NVS_KEY_ORIG_TN, value);
+        nvs_set_str(h, key, value);
     } else {
-        nvs_erase_key(h, NVS_KEY_ORIG_TN);
+        nvs_erase_key(h, key);
     }
     nvs_commit(h);
     nvs_close(h);
 }
 
+static bool nvs_load_orig(char *out, size_t size)
+{
+    return nvs_load_key(NVS_KEY_ORIG_TN, out, size);
+}
+
+static void nvs_store_orig(const char *value)
+{
+    nvs_store_key(NVS_KEY_ORIG_TN, value);
+}
+
+static void nvs_store_qsy(bool saved)
+{
+    if (!saved) {
+        nvs_store_key(NVS_KEY_ORIG_QSY, NULL);
+        return;
+    }
+    char value[64];
+    snprintf(value, sizeof(value), "%s;%s;%s", s_orig_vm, s_orig_mr, s_orig_fq);
+    nvs_store_key(NVS_KEY_ORIG_QSY, value);
+}
+
+/* Load the pre-QSY state left by an interrupted session, if any. */
+static bool nvs_load_qsy(void)
+{
+    char value[64];
+    if (!nvs_load_key(NVS_KEY_ORIG_QSY, value, sizeof(value))) {
+        return false;
+    }
+    char *mr = strchr(value, ';');
+    char *fq = mr ? strchr(mr + 1, ';') : NULL;
+    if (!mr || !fq || strncmp(value, "VM ", 3) != 0 || strncmp(fq + 1, "FQ ", 3) != 0) {
+        nvs_store_key(NVS_KEY_ORIG_QSY, NULL); /* unreadable; drop it */
+        return false;
+    }
+    *mr++ = '\0';
+    *fq++ = '\0';
+    strlcpy(s_orig_vm, value, sizeof(s_orig_vm));
+    strlcpy(s_orig_mr, mr, sizeof(s_orig_mr));
+    strlcpy(s_orig_fq, fq, sizeof(s_orig_fq));
+    return true;
+}
+
 /* ---------- CAT helpers ---------- */
 
-/* A reply belongs to `cmd` if it echoes the 2-letter command or is "?". */
+/* A reply belongs to `cmd` if it echoes the 2-letter command or is "?".
+ * MR answers a bare "N" when the band is on the VFO. */
 static bool reply_matches(const char *cmd, const char *reply)
 {
-    return strcmp(reply, "?") == 0 || strncmp(reply, cmd, 2) == 0;
+    return strcmp(reply, "?") == 0 || strncmp(reply, cmd, 2) == 0 ||
+           (strncmp(cmd, "MR", 2) == 0 && strcmp(reply, "N") == 0);
 }
 
 static esp_err_t cat_query(const char *cmd, char *reply, size_t reply_size)
@@ -245,6 +318,7 @@ static bool parse_tn(const char *reply, char *mode, char *band)
 
 static void set_kiss_active(bool active)
 {
+    s_radio_mid_frame = false;
     s_kiss_active = active;
     if (active) {
         xEventGroupSetBits(s_flags, BIT_KISS_ACTIVE);
@@ -348,6 +422,11 @@ static void radio_bringup(void)
         strlcpy(s_orig_tn, reply, sizeof(s_orig_tn));
         ESP_LOGI(TAG, "radio TNC mode: %s", s_orig_tn);
     }
+    if (nvs_load_qsy()) {
+        s_qsy_saved = true;
+        ESP_LOGW(TAG, "recovering the band from an interrupted session: %s, %s, %s",
+                 s_orig_vm, s_orig_mr, s_orig_fq);
+    }
     s_in_kiss = false;
     s_radio_ok = true;
 }
@@ -434,23 +513,73 @@ static char tnc_band(void)
     return parse_tn(s_orig_tn, &mode, &band) ? band : '1';
 }
 
-/* CAT mode only. Put the band back to its pre-QSY frequency and VFO/memory mode. */
+static bool is_channel_number(const char *ch)
+{
+    return strlen(ch) == 3 && ch[0] >= '0' && ch[0] <= '9' && ch[1] >= '0' && ch[1] <= '9' &&
+           ch[2] >= '0' && ch[2] <= '9';
+}
+
+/*
+ * CAT mode only. Put the band back exactly as it was before the first QSY:
+ * VFO frequency, VFO/memory mode, and the memory channel. Numbered channels
+ * are re-selected explicitly (MR b,nnn); special ones such as the D750's APRS
+ * channel ("MR AP") can't be set over CAT, but switching back to memory mode
+ * returns the band to them. Logs the band's final state.
+ */
 static void qsy_restore_cat(void)
 {
     if (!s_qsy_saved) {
         return;
     }
-    char reply[CAT_LINE_MAX];
+    const char band = s_orig_vm[3];
+    char cmd[24], reply[CAT_LINE_MAX];
+
+    /* The VFO frequency can only be set on the VFO. */
+    snprintf(cmd, sizeof(cmd), "VM %c,0", band);
+    cat_query(cmd, reply, sizeof(reply));
     if (cat_query(s_orig_fq, reply, sizeof(reply)) != ESP_OK || strcmp(reply, s_orig_fq) != 0) {
         ESP_LOGE(TAG, "QSY restore: %s failed (%s)", s_orig_fq, reply);
     }
-    if (s_orig_vm[strlen(s_orig_vm) - 1] != '0') { /* was not on the VFO */
+
+    const bool was_memory = s_orig_vm[strlen(s_orig_vm) - 1] != '0';
+    if (was_memory) {
         if (cat_query(s_orig_vm, reply, sizeof(reply)) != ESP_OK || strcmp(reply, s_orig_vm) != 0) {
             ESP_LOGE(TAG, "QSY restore: %s failed (%s)", s_orig_vm, reply);
         }
+        snprintf(cmd, sizeof(cmd), "MR %c", band);
+        if (strncmp(s_orig_mr, "MR ", 3) == 0 &&
+            cat_query(cmd, reply, sizeof(reply)) == ESP_OK && strcmp(reply, s_orig_mr) != 0) {
+            const char *ch = s_orig_mr + 3;
+            if (is_channel_number(ch)) {
+                snprintf(cmd, sizeof(cmd), "MR %c,%s", band, ch);
+                if (cat_query(cmd, reply, sizeof(reply)) != ESP_OK || strcmp(reply, cmd) != 0) {
+                    ESP_LOGE(TAG, "QSY restore: %s failed (%s)", cmd, reply);
+                }
+            } else {
+                ESP_LOGW(TAG, "QSY restore: band is on %s, was %s (can't select that channel over CAT)",
+                         reply, s_orig_mr);
+            }
+        }
     }
-    ESP_LOGI(TAG, "QSY restored: %s, %s", s_orig_fq, s_orig_vm);
+
+    /* Read back and report where the band actually is now. */
+    char vm[16] = "", mr[16] = "", fq[24] = "";
+    snprintf(cmd, sizeof(cmd), "VM %c", band);
+    cat_query(cmd, vm, sizeof(vm));
+    snprintf(cmd, sizeof(cmd), "MR %c", band);
+    cat_query(cmd, mr, sizeof(mr));
+    snprintf(cmd, sizeof(cmd), "FQ %c", band);
+    cat_query(cmd, fq, sizeof(fq));
+    const bool ok = strcmp(vm, s_orig_vm) == 0 && strcmp(mr, s_orig_mr) == 0;
+    if (ok) {
+        ESP_LOGI(TAG, "QSY restored: band %c is back on %s, %s, %s", band == '0' ? 'A' : 'B', vm,
+                 mr, fq);
+    } else {
+        ESP_LOGW(TAG, "QSY restore incomplete: band now %s, %s, %s; was %s, %s, %s", vm, mr, fq,
+                 s_orig_vm, s_orig_mr, s_orig_fq);
+    }
     s_qsy_saved = false;
+    nvs_store_qsy(false);
 }
 
 /* CAT mode only. Switch the TNC band to VFO and tune it to `hz`. */
@@ -465,6 +594,10 @@ static bool qsy_set_cat(uint32_t hz)
             strncmp(s_orig_vm, "VM ", 3) != 0) {
             ESP_LOGE(TAG, "QSY: cannot read %s (%s)", cmd, s_orig_vm);
             return false;
+        }
+        snprintf(cmd, sizeof(cmd), "MR %c", band);
+        if (cat_query(cmd, s_orig_mr, sizeof(s_orig_mr)) != ESP_OK) {
+            strlcpy(s_orig_mr, "N", sizeof(s_orig_mr));
         }
     }
     /* FQ only works on a VFO. */
@@ -481,7 +614,8 @@ static bool qsy_set_cat(uint32_t hz)
             return false;
         }
         s_qsy_saved = true;
-        ESP_LOGI(TAG, "QSY: saved %s, %s", s_orig_vm, s_orig_fq);
+        nvs_store_qsy(true); /* so a reset mid-session can still restore the channel */
+        ESP_LOGI(TAG, "QSY: saved %s, %s, %s", s_orig_vm, s_orig_mr, s_orig_fq);
     }
     snprintf(cmd, sizeof(cmd), "FQ %c,%010lu", band, (unsigned long)hz);
     if (cat_query(cmd, reply, sizeof(reply)) != ESP_OK || strcmp(reply, cmd) != 0) {
@@ -493,18 +627,12 @@ static bool qsy_set_cat(uint32_t hz)
     return true;
 }
 
-static void restart_grace_timer(void)
-{
-#if CONFIG_QRV_LINK_QSY_EXPERIMENT
-    xTimerReset(s_grace_timer, 0);
-#endif
-}
-
 /*
- * Run a QSY step over CAT. With lazy KISS entry the radio is usually still in
- * CAT mode, so no mode change is needed at all. If KISS is already on, leave
- * it for the CAT step; after a QSY go straight back, after a restore stay in
- * CAT (the app is about to leave) until it sends data again. Control task only.
+ * Run a QSY step over CAT. If KISS is on, leave it for the CAT step and go
+ * back afterwards. With CONFIG_QRV_LINK_LAZY_KISS the radio is usually still in
+ * CAT when the QSY arrives, so no mode change is needed, and after a restore it
+ * stays in CAT (the app is about to leave) until the app sends data again.
+ * Control task only.
  */
 static void qsy_handle(bridge_event_t type, uint32_t hz)
 {
@@ -525,8 +653,15 @@ static void qsy_handle(bridge_event_t type, uint32_t hz)
         }
     } else {
         qsy_restore_cat();
+#if CONFIG_QRV_LINK_LAZY_KISS
+        /* The app is usually about to leave: stay in CAT until it sends data. */
         s_kiss_needed = false;
-        restart_grace_timer();
+        xTimerReset(s_grace_timer, 0);
+#else
+        if (was_kiss) {
+            enter_kiss();
+        }
+#endif
     }
 }
 
@@ -585,7 +720,7 @@ static void control_task(void *arg)
                 break;
             case EV_SESSION_OPEN:
                 s_want_kiss = true;
-#if CONFIG_QRV_LINK_QSY_EXPERIMENT
+#if CONFIG_QRV_LINK_LAZY_KISS
                 /* Lazy entry: a QSY usually follows within ~2 s and needs CAT,
                  * so don't switch to KISS until the app sends data or the
                  * grace period ends. */
@@ -639,7 +774,53 @@ static void forward_to_radio(const uint8_t *data, size_t len)
     }
 }
 
-#if CONFIG_QRV_LINK_QSY_EXPERIMENT
+/*
+ * Send an adapter-generated KISS frame (a SetHardware reply) to the app. Waits
+ * briefly for any radio frame in flight to finish so the two never interleave.
+ * app_tx task only.
+ */
+static void reply_to_app(uint8_t subcmd, const uint8_t *data, size_t len)
+{
+    uint8_t frame[80];
+    size_t n = 0;
+    frame[n++] = KISS_FEND;
+    frame[n++] = KISS_CMD_SETHW;
+    const uint8_t first = subcmd;
+    for (size_t i = 0; i <= len && n < sizeof(frame) - 3; i++) {
+        const uint8_t c = i == 0 ? first : data[i - 1];
+        if (c == KISS_FEND) {
+            frame[n++] = KISS_FESC;
+            frame[n++] = KISS_TFEND;
+        } else if (c == KISS_FESC) {
+            frame[n++] = KISS_FESC;
+            frame[n++] = KISS_TFESC;
+        } else {
+            frame[n++] = c;
+        }
+    }
+    frame[n++] = KISS_FEND;
+
+    for (int waited = 0;; waited += 10) {
+        xSemaphoreTake(s_to_app_lock, portMAX_DELAY);
+        if (!s_kiss_active || !s_radio_mid_frame || waited >= REPLY_BOUNDARY_WAIT_MS) {
+            size_t sent = ble_kiss_send(frame, n);
+            xSemaphoreGive(s_to_app_lock);
+            if (sent < n) {
+                ESP_LOGW(TAG, "reply 0x%02x not delivered (no subscriber or buffer full)", subcmd);
+            }
+            return;
+        }
+        xSemaphoreGive(s_to_app_lock);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void reply16_to_app(uint8_t subcmd, uint16_t value)
+{
+    const uint8_t data[2] = { (uint8_t)(value >> 8), (uint8_t)(value & 0xFF) };
+    reply_to_app(subcmd, data, sizeof(data));
+}
+
 /* Hand a CAT step to the control task and wait for it, so later frames are
  * not written while the radio is out of KISS. */
 static void run_qsy_step(bridge_event_t type, uint32_t hz)
@@ -653,7 +834,17 @@ static void run_qsy_step(bridge_event_t type, uint32_t hz)
 /* A SetHardware frame from the app: handle the ones we know, never pass to the radio. */
 static void handle_sethw(const uint8_t *p, size_t n)
 {
-    if (n >= 5 && p[0] == SETHW_QSY) {
+    if (n >= 1 && p[0] == SETHW_GET_FW_VERSION) {
+        const char *version = esp_app_get_description()->version;
+        ESP_LOGI(TAG, "app asked for firmware version: %s", version);
+        reply_to_app(SETHW_GET_FW_VERSION, (const uint8_t *)version, strlen(version));
+    } else if (n >= 1 && p[0] == SETHW_GET_API_VERSION) {
+        ESP_LOGI(TAG, "app asked for API version: 0x%04x", QRV_API_VERSION);
+        reply16_to_app(SETHW_GET_API_VERSION, QRV_API_VERSION);
+    } else if (n >= 1 && p[0] == SETHW_GET_CAPABILITIES) {
+        ESP_LOGI(TAG, "app asked for capabilities: 0x%04x", QRV_CAPABILITIES);
+        reply16_to_app(SETHW_GET_CAPABILITIES, QRV_CAPABILITIES);
+    } else if (n >= 5 && p[0] == SETHW_QSY) {
         uint32_t hz = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) |
                       ((uint32_t)p[3] << 8) | p[4];
         ESP_LOGI(TAG, "app QSY request: %lu Hz", (unsigned long)hz);
@@ -739,20 +930,6 @@ static void app_tx_task(void *arg)
         }
     }
 }
-#else
-/* Moves app data to the radio once KISS is up. */
-static void app_tx_task(void *arg)
-{
-    (void)arg;
-    uint8_t buf[256];
-    for (;;) {
-        size_t n = xStreamBufferReceive(s_app_tx, buf, sizeof(buf), portMAX_DELAY);
-        if (n > 0) {
-            forward_to_radio(buf, n);
-        }
-    }
-}
-#endif
 
 static void grace_timer_cb(TimerHandle_t t)
 {
@@ -766,9 +943,11 @@ esp_err_t bridge_start(const char *ble_name)
     s_flags = xEventGroupCreate();
     s_app_tx = xStreamBufferCreate(APP_TX_BUF_SIZE, 1);
     s_param_lock = xSemaphoreCreateMutex();
+    s_to_app_lock = xSemaphoreCreateMutex();
     s_grace_timer = xTimerCreate("kiss_grace", pdMS_TO_TICKS(KISS_GRACE_MS), pdFALSE, NULL,
                                  grace_timer_cb);
-    ESP_RETURN_ON_FALSE(s_events && s_flags && s_app_tx && s_param_lock && s_grace_timer,
+    ESP_RETURN_ON_FALSE(s_events && s_flags && s_app_tx && s_param_lock && s_to_app_lock &&
+                        s_grace_timer,
                         ESP_ERR_NO_MEM, TAG, "no memory");
     ESP_RETURN_ON_ERROR(cat_init(), TAG, "cat_init");
 

@@ -17,13 +17,13 @@ menu "QRV Link"
             characteristic. Useful to see what an app sends besides KISS
             data frames.
 
-    config QRV_LINK_QSY_EXPERIMENT
-        bool "EXPERIMENT: translate app frequency requests (QSY) to CAT"
+    config QRV_LINK_LAZY_KISS
+        bool "Defer the switch to KISS until the app needs it"
         default n
         help
-            Handle the KISS SetHardware frames RadioMail sends to adapters
-            named "B.B. Link" (0xEA = set frequency, 0xEB = restore). The
-            bridge leaves KISS, sets the TNC band's VFO frequency over CAT and
-            re-enters KISS. Observed behaviour, not a published protocol.
+            Stay in CAT mode when an app subscribes and switch the TNC to KISS
+            on the app's first data frame, or after 3 s if it sends nothing.
+            A frequency change (SetHardware 0xEA) that arrives first then
+            needs no KISS exit. Listen-only apps miss packets during those 3 s.
 
 endmenu
